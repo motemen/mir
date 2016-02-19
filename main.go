@@ -3,7 +3,6 @@ package main
 import (
 	"compress/gzip"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -102,7 +101,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			repoPath = repoPath + ".git"
 		}
 
-		var r io.Reader
+		r := req.Body
 		if req.Header.Get("Content-Encoding") == "gzip" {
 			var err error
 			r, err = gzip.NewReader(req.Body)
@@ -111,18 +110,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-		} else {
-			r = req.Body
 		}
 
 		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 		w.Header().Set("Cache-Control", "no-cache")
-		// w.Header().Set("Transfer-Encoding", "identity")
 
 		upstream := s.upstream + repoPath
-		dir := s.localDir(upstream)
-		cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
-		cmd.Dir = dir
+		cmd := exec.Command("git", "upload-pack", "--stateless-rpc", s.localDir(upstream))
 		cmd.Stdout = w
 		cmd.Stdin = r
 		cmd.Stderr = os.Stderr // TODO: to log
@@ -132,11 +126,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		return
+	} else {
+		http.Error(w, "Not Implemented", http.StatusNotImplemented)
 	}
-
-	http.Error(w, "Not Implemented", http.StatusNotImplemented)
 }
 
 func main() {
