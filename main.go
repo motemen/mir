@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,10 @@ func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
 }
 
+type upstreamRepo struct {
+	URL *url.URL
+}
+
 type server struct {
 	upstream  string
 	cacheRoot string
@@ -24,48 +29,51 @@ type server struct {
 	upstreamLocks   map[string]sync.Mutex
 }
 
-func (s server) localDir(upstream string) string {
-	upstream = strings.Replace(upstream, "/", "-", -1)
-	upstream = strings.Replace(upstream, ":", "-", -1)
-	return filepath.Join(s.cacheRoot, upstream)
+func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
+	if !strings.HasSuffix(path, ".git") {
+		path = path + ".git"
+	}
+	u, err := url.Parse(s.upstream + path)
+	if err != nil {
+		return nil, err
+	}
+
+	return &upstreamRepo{URL: u}, nil
 }
 
-func (s server) updateLocalCache(upstream string) error {
-	dir := s.localDir(upstream)
+func (s server) cacheDir(repo *upstreamRepo) string {
+	path := append([]string{s.cacheRoot, repo.URL.Host}, strings.Split(repo.URL.Path, "/")...)
+	return filepath.Join(path...)
+}
+
+func (s server) synchronizeCache(repo *upstreamRepo) error {
+	dir := s.cacheDir(repo)
+
 	fi, err := os.Stat(dir)
-	if fi == nil {
+	if err != nil {
 		if os.IsNotExist(err) {
-			cmd := exec.Command("git", "clone", "--mirror", upstream, dir)
+			// cache does not exist, so initialize one (may take long)
+			if err := os.MkdirAll(filepath.Base(dir), 0777); err != nil {
+				return err
+			}
+
+			cmd := exec.Command("git", "clone", "--mirror", repo.URL.String(), dir)
 			cmd.Stdout = os.Stdout // TODO: to log
 			cmd.Stderr = os.Stderr
 			return cmd.Run()
-		} else {
-			return err
 		}
-	} else if fi.IsDir() {
+
+		return err
+	} else if fi != nil && fi.IsDir() {
+		// cache exists, update it
 		cmd := exec.Command("git", "remote", "update")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Dir = dir
 		return cmd.Run()
-	} else {
-		return fmt.Errorf("not a directory: %s", dir)
 	}
-}
 
-func (s *server) getRepos(path string) (string, string) {
-	if !strings.HasSuffix(path, ".git") {
-		path = path + ".git"
-	}
-	u := s.upstreamRepo(path)
-	return u, s.localDir(u)
-}
-
-func (s *server) upstreamRepo(path string) string {
-	if !strings.HasSuffix(path, ".git") {
-		path = path + ".git"
-	}
-	return s.upstream + path
+	return fmt.Errorf("cache could not synchronize: %v", repo)
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -73,11 +81,17 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
 		// mode: ref delivery
-		repoPath := strings.TrimSuffix(req.URL.Path, "/info/refs")
-		upstreamURL, localDir := s.getRepos(repoPath)
-
-		err := s.updateLocalCache(upstreamURL)
+		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/info/refs")
+		repo, err := s.upstreamRepo(repoPath)
 		if err != nil {
+			log.Println(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// NOTE: serve remote content and defer synchronization to upload-pack phase?
+		if err := s.synchronizeCache(repo); err != nil {
+			log.Println(err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -86,7 +100,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprint(w, "001e# service=git-upload-pack\n")
 		fmt.Fprint(w, "0000")
 
-		cmd := exec.Command("git", "upload-pack", "--advertise-refs", localDir)
+		cmd := exec.Command("git", "upload-pack", "--advertise-refs", s.cacheDir(repo))
 		cmd.Stdout = w
 		cmd.Stderr = os.Stderr
 		err = cmd.Run()
@@ -96,9 +110,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	} else if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/git-upload-pack") {
 		// mode: upload-pack
 		// TODO: lock
-		repoPath := strings.TrimSuffix(req.URL.Path, "/git-upload-pack")
-		if !strings.HasSuffix(repoPath, ".git") {
-			repoPath = repoPath + ".git"
+		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/git-upload-pack")
+		repo, err := s.upstreamRepo(repoPath)
+		if err != nil {
+			log.Println(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		r := req.Body
@@ -115,15 +132,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 		w.Header().Set("Cache-Control", "no-cache")
 
-		upstream := s.upstream + repoPath
-		cmd := exec.Command("git", "upload-pack", "--stateless-rpc", s.localDir(upstream))
+		cmd := exec.Command("git", "upload-pack", "--stateless-rpc", s.cacheDir(repo))
 		cmd.Stdout = w
 		cmd.Stdin = r
 		cmd.Stderr = os.Stderr // TODO: to log
 
 		if err := cmd.Run(); err != nil {
 			log.Println(err)
-			// http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	} else {
@@ -133,7 +148,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 func main() {
 	s := server{
-		upstream:      "https://github.com",
+		upstream:      "https://github.com/",
 		cacheRoot:     "./cache",
 		upstreamLocks: map[string]sync.Mutex{},
 	}
