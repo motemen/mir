@@ -73,6 +73,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	log.Printf("%s %s %s %v", req.Method, req.URL, req.Proto, req.Header)
 
 	if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
+		// mode: ref delivery
 		repoPath := strings.TrimSuffix(req.URL.Path, "/info/refs")
 		upstreamURL, localDir := s.getRepos(repoPath)
 
@@ -93,44 +94,6 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			log.Println(err)
 		}
-	} else if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
-		// mode: ref delivery
-		repoPath := strings.TrimSuffix(req.URL.Path, "/info/refs")
-		if !strings.HasSuffix(repoPath, ".git") {
-			repoPath = repoPath + ".git"
-		}
-		upstream := s.upstream + repoPath
-
-		s.upstreamLocksMu.Lock()
-
-		mu, ok := s.upstreamLocks[upstream]
-		if !ok {
-			mu = sync.Mutex{}
-			s.upstreamLocks[upstream] = mu
-		}
-
-		s.upstreamLocksMu.Unlock()
-
-		mu.Lock()
-		defer mu.Unlock()
-
-		log.Printf("upstream: %v", upstream)
-
-		resp, err := http.Get(upstream + "/info/refs?service=git-upload-pack")
-		if err != nil {
-			httpFatal(w, err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-
-		io.Copy(w, resp.Body)
-
-		// TODO: do "git pull" or "git clone --mirror" with lock only if the refs do not match
-		// if err := s.updateLocalCache(upstream); err != nil {
-		// 	httpFatal(w, err)
-		// 	return
-		// }
 	} else if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/git-upload-pack") {
 		// mode: upload-pack
 		// TODO: lock
@@ -173,12 +136,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// http.Error(w, "Not Implemented", http.StatusNotImplemented)
-}
-
-func httpFatal(w http.ResponseWriter, err error) {
-	log.Println(err)
-	http.Error(w, err.Error(), http.StatusInternalServerError)
+	http.Error(w, "Not Implemented", http.StatusNotImplemented)
 }
 
 func main() {
