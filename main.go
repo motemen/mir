@@ -1,14 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"compress/gzip"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +26,6 @@ type server struct {
 }
 
 func (s server) localDir(upstream string) string {
-	// TODO escape special characters
 	upstream = strings.Replace(upstream, "/", "-", -1)
 	upstream = strings.Replace(upstream, ":", "-", -1)
 	return filepath.Join(s.cacheRoot, upstream)
@@ -58,25 +54,42 @@ func (s server) updateLocalCache(upstream string) error {
 	}
 }
 
+func (s *server) getRepos(path string) (string, string) {
+	if !strings.HasSuffix(path, ".git") {
+		path = path + ".git"
+	}
+	u := s.upstreamRepo(path)
+	return u, s.localDir(u)
+}
+
+func (s *server) upstreamRepo(path string) string {
+	if !strings.HasSuffix(path, ".git") {
+		path = path + ".git"
+	}
+	return s.upstream + path
+}
+
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	log.Printf("%s %s %s %v", req.Method, req.URL, req.Proto, req.Header)
 
 	if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
 		repoPath := strings.TrimSuffix(req.URL.Path, "/info/refs")
-		if !strings.HasSuffix(repoPath, ".git") {
-			repoPath = repoPath + ".git"
+		upstreamURL, localDir := s.getRepos(repoPath)
+
+		err := s.updateLocalCache(upstreamURL)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
 		fmt.Fprint(w, "001e# service=git-upload-pack\n")
 		fmt.Fprint(w, "0000")
 
-		upstream := s.upstream + repoPath
-		dir := s.localDir(upstream)
-		cmd := exec.Command("git", "upload-pack", "--advertise-refs", dir)
+		cmd := exec.Command("git", "upload-pack", "--advertise-refs", localDir)
 		cmd.Stdout = w
 		cmd.Stderr = os.Stderr
-		err := cmd.Run()
+		err = cmd.Run()
 		if err != nil {
 			log.Println(err)
 		}
@@ -111,37 +124,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
 
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			line := scanner.Text()
-			log.Printf("[%s] %q", upstream, line)
-			line = strings.Replace(line, " no-done", "        ", -1)
-			fmt.Fprintln(w, line)
-		}
-		if err := scanner.Err(); err != nil {
-			httpFatal(w, err)
-			return
-		}
+		io.Copy(w, resp.Body)
 
 		// TODO: do "git pull" or "git clone --mirror" with lock only if the refs do not match
 		// if err := s.updateLocalCache(upstream); err != nil {
 		// 	httpFatal(w, err)
 		// 	return
 		// }
-	} else if false && req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/git-upload-pack") {
-		resp, err := http.Post("https://github.com"+req.URL.Path, req.Header.Get("Content-Type"), req.Body)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		for k, v := range resp.Header {
-			log.Printf("%v %v", k, v)
-			for _, v := range v {
-				w.Header().Set(k, v)
-			}
-		}
-		r := io.TeeReader(resp.Body, os.Stderr)
-		io.Copy(w, r)
 	} else if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/git-upload-pack") {
 		// mode: upload-pack
 		// TODO: lock
@@ -172,17 +161,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
 		cmd.Dir = dir
 		cmd.Stdout = w
-		// cmd.Stdout = bufio.NewWriterSize(w, 8)
-		// cmd.Stdin = io.TeeReader(r, os.Stderr)
 		cmd.Stdin = r
 		cmd.Stderr = os.Stderr // TODO: to log
-		// b, err := cmd.Output()
-		// if err != nil {
-		// 	log.Println(err)
-		// 	return
-		// }
-		// w.Write(b)
-		// ioutil.WriteFile("tmp", b, 0777)
 
 		if err := cmd.Run(); err != nil {
 			log.Println(err)
@@ -202,15 +182,6 @@ func httpFatal(w http.ResponseWriter, err error) {
 }
 
 func main() {
-	go func() {
-		u, _ := url.Parse("https://github.com")
-		p := httputil.NewSingleHostReverseProxy(u)
-		err := http.ListenAndServe("localhost:9281", p)
-		if err != nil {
-			log.Println(err)
-		}
-	}()
-
 	s := server{
 		upstream:      "https://github.com",
 		cacheRoot:     "./cache",
@@ -221,5 +192,4 @@ func main() {
 	if err != nil {
 		log.Println(err)
 	}
-	_ = s
 }
