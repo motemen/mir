@@ -195,7 +195,7 @@ func main() {
 		upstream:  "https://github.com/",
 		cacheRoot: "./cache",
 	}
-	log.Println("git-slave-proxy-server starting at :9280 ...")
+	log.Println("mir starting at :9280 ...")
 	err := http.ListenAndServe("localhost:9280", &s)
 	if err != nil {
 		log.Println(err)
