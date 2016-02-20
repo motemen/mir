@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -24,10 +25,10 @@ type upstreamRepo struct {
 }
 
 type server struct {
-	upstream  string
-	cacheRoot string
+	upstream string
+	basePath string
 
-	upstreams struct {
+	repoMutexes struct {
 		sync.Mutex
 		m map[string]sync.RWMutex
 	}
@@ -45,23 +46,24 @@ func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
 	return &upstreamRepo{URL: u}, nil
 }
 
-func (s server) cacheDir(repo *upstreamRepo) string {
-	path := append([]string{s.cacheRoot, repo.URL.Host}, strings.Split(repo.URL.Path, "/")...)
+func (s server) localDir(repo *upstreamRepo) string {
+	path := append([]string{s.basePath, repo.URL.Host}, strings.Split(repo.URL.Path, "/")...)
 	return filepath.Join(path...)
 }
 
 func (s *server) repoMutex(repo *upstreamRepo) *sync.RWMutex {
-	s.upstreams.Lock()
-	defer s.upstreams.Unlock()
+	s.repoMutexes.Lock()
+	defer s.repoMutexes.Unlock()
 
-	if s.upstreams.m == nil {
-		s.upstreams.m = map[string]sync.RWMutex{}
+	if s.repoMutexes.m == nil {
+		s.repoMutexes.m = map[string]sync.RWMutex{}
 	}
 
-	mu, ok := s.upstreams.m[repo.URL.String()]
+	repoURL := repo.URL.String()
+	mu, ok := s.repoMutexes.m[repoURL]
 	if !ok {
 		mu = sync.RWMutex{}
-		s.upstreams.m[repo.URL.String()] = mu
+		s.repoMutexes.m[repoURL] = mu
 	}
 
 	return &mu
@@ -72,7 +74,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	dir := s.cacheDir(repo)
+	dir := s.localDir(repo)
 
 	fi, err := os.Stat(dir)
 	if err != nil {
@@ -121,7 +123,7 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 	cmd := exec.Command("git", "upload-pack", "--advertise-refs", ".")
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
-	cmd.Dir = s.cacheDir(repo)
+	cmd.Dir = s.localDir(repo)
 	err := cmd.Run()
 	if err != nil {
 		log.Println(err)
@@ -142,7 +144,7 @@ func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.Read
 	cmd.Stdout = w
 	cmd.Stdin = r
 	cmd.Stderr = os.Stderr // TODO: to log
-	cmd.Dir = s.cacheDir(repo)
+	cmd.Dir = s.localDir(repo)
 	if err := cmd.Run(); err != nil {
 		log.Println(err)
 		return
@@ -191,12 +193,26 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
-	s := server{
-		upstream:  "https://github.com/",
-		cacheRoot: "./cache",
+	var (
+		s      server
+		listen string
+	)
+	flag.StringVar(&s.upstream, "upstream", "", "upstream repositories' base `URL`")
+	flag.StringVar(&s.basePath, "base-path", "", "base `directory` for locally cloned repositories")
+	flag.StringVar(&listen, "listen", ":9280", "`address` to listen to")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s -listen=<addr> -upstream=<url> -base-path=<path>\n", os.Args[0])
+		flag.PrintDefaults()
 	}
-	log.Println("mir starting at :9280 ...")
-	err := http.ListenAndServe("localhost:9280", &s)
+	flag.Parse()
+
+	if s.upstream == "" || s.basePath == "" {
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	log.Printf("mir starting at %s ...", listen)
+	err := http.ListenAndServe(listen, &s)
 	if err != nil {
 		log.Println(err)
 	}

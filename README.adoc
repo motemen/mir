@@ -7,7 +7,13 @@ Usage
 -----
 
 ----
-mir -port=<port> -upstream=<url> -local-repo-root=<path>
+mir -listen=<addr> -upstream=<url> -base-path=<path>
+----
+
+For example:
+
+----
+mir -listen=:8080 -upstream=https://github.com/ -base-path=/var/lib/mir/cache
 ----
 
 Description
