@@ -1,0 +1,17 @@
+mir
+===
+
+mir - A simple Git slave (smart) HTTP server.
+
+Usage
+-----
+
+----
+mir -port=<port> -upstream=<url> -local-repo-root=<path>
+----
+
+Description
+-----------
+
+mir behaves as a (smart) Git HTTP server.
+When a client requested to fetch a repository from it, mir first synchronizes the local repository to the "upstream" one, and serves the requested pack from the local repository, thus scales git repositories to fetching.
