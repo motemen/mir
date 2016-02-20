@@ -1,16 +1,18 @@
 package main
 
 import (
-	"compress/gzip"
 	"fmt"
+	"io"
 	"log"
-	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"compress/gzip"
+	"net/http"
+	"net/url"
 )
 
 func init() {
@@ -100,6 +102,53 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 	return fmt.Errorf("cache could not synchronize: %v", repo)
 }
 
+func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
+	// NOTE: serve remote content and defer synchronization to upload-pack phase?
+	if err := s.synchronizeCache(repo); err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+	fmt.Fprint(w, "001e# service=git-upload-pack\n")
+	fmt.Fprint(w, "0000")
+
+	mu := s.repoMutex(repo)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	cmd := exec.Command("git", "upload-pack", "--advertise-refs", ".")
+	cmd.Stdout = w
+	cmd.Stderr = os.Stderr
+	cmd.Dir = s.cacheDir(repo)
+	err := cmd.Run()
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.ReadCloser) {
+	mu := s.repoMutex(repo)
+	mu.RLock()
+	defer mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	defer r.Close()
+
+	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
+	cmd.Stdout = w
+	cmd.Stdin = r
+	cmd.Stderr = os.Stderr // TODO: to log
+	cmd.Dir = s.cacheDir(repo)
+	if err := cmd.Run(); err != nil {
+		log.Println(err)
+		return
+	}
+}
+
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	log.Printf("%s %s %s %v", req.Method, req.URL, req.Proto, req.Header)
 
@@ -113,29 +162,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		// NOTE: serve remote content and defer synchronization to upload-pack phase?
-		if err := s.synchronizeCache(repo); err != nil {
-			log.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-		fmt.Fprint(w, "001e# service=git-upload-pack\n")
-		fmt.Fprint(w, "0000")
-
-		mu := s.repoMutex(repo)
-		mu.RLock()
-		defer mu.RUnlock()
-
-		cmd := exec.Command("git", "upload-pack", "--advertise-refs", ".")
-		cmd.Stdout = w
-		cmd.Stderr = os.Stderr
-		cmd.Dir = s.cacheDir(repo)
-		err = cmd.Run()
-		if err != nil {
-			log.Println(err)
-		}
+		s.advertiseRefs(repo, w)
 	} else if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/git-upload-pack") {
 		// mode: upload-pack
 		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/git-upload-pack")
@@ -145,10 +172,6 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		mu := s.repoMutex(repo)
-		mu.RLock()
-		defer mu.RUnlock()
 
 		r := req.Body
 		if req.Header.Get("Content-Encoding") == "gzip" {
@@ -161,18 +184,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 
-		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-		w.Header().Set("Cache-Control", "no-cache")
-
-		cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
-		cmd.Stdout = w
-		cmd.Stdin = r
-		cmd.Stderr = os.Stderr // TODO: to log
-		cmd.Dir = s.cacheDir(repo)
-		if err := cmd.Run(); err != nil {
-			log.Println(err)
-			return
-		}
+		s.uploadPack(repo, w, r)
 	} else {
 		http.Error(w, "Not Implemented", http.StatusNotImplemented)
 	}
