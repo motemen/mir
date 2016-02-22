@@ -49,6 +49,9 @@ func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
 }
 
 func (s server) localDir(repo *upstreamRepo) string {
+	// TODO(motemen): include protocols (e.g. "https") for completeness
+	// Note that "ssh://user@example.com/foo/bar" and "user@example.com:foo/bar" differs
+	// (git/Documentation/technical/pack-protocol.txt)
 	path := append([]string{s.basePath, repo.URL.Host}, strings.Split(repo.URL.Path, "/")...)
 	return filepath.Join(path...)
 }
@@ -83,7 +86,7 @@ func runCommandLogged(cmd *exec.Cmd) error {
 		{"err", cmd.Stderr, cmd.StderrPipe},
 	}
 
-	log.Printf("[command %p] Running %q", cmd, cmd.Args)
+	log.Printf("[command %p] Running %q dir=%s", cmd, cmd.Args, cmd.Dir)
 
 	for _, o := range outs {
 		if o.w != nil {
