@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"compress/gzip"
 	"net/http"
@@ -69,6 +71,54 @@ func (s *server) repoMutex(repo *upstreamRepo) *sync.RWMutex {
 	return &mu
 }
 
+func runCommandLogged(cmd *exec.Cmd) error {
+	var wg sync.WaitGroup
+
+	outs := []struct {
+		name string
+		w    io.Writer
+		pipe func() (io.ReadCloser, error)
+	}{
+		{"out", cmd.Stdout, cmd.StdoutPipe},
+		{"err", cmd.Stderr, cmd.StderrPipe},
+	}
+
+	log.Printf("[command %p] Running %q", cmd, cmd.Args)
+
+	for _, o := range outs {
+		if o.w != nil {
+			continue
+		}
+
+		r, err := o.pipe()
+		if err != nil {
+			return err
+		}
+
+		wg.Add(1)
+		go func(name string, r io.Reader) {
+			scanner := bufio.NewScanner(r)
+			for scanner.Scan() {
+				log.Printf("[command %p :: %s] %s", cmd, name, scanner.Text())
+			}
+			if err := scanner.Err(); err != nil {
+				log.Printf("[command %p !! %s] error=%v", cmd, name, err)
+			}
+			wg.Done()
+		}(o.name, r)
+	}
+
+	start := time.Now()
+	cmd.Start()
+
+	wg.Wait()
+
+	err := cmd.Wait()
+	log.Printf("[command %p] %q done in %s", cmd, cmd.Args, time.Now().Sub(start))
+
+	return err
+}
+
 func (s *server) synchronizeCache(repo *upstreamRepo) error {
 	mu := s.repoMutex(repo)
 	mu.Lock()
@@ -84,21 +134,17 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 				return err
 			}
 
-			cmd := exec.Command("git", "clone", "--mirror", repo.URL.String(), ".")
-			cmd.Stdout = os.Stdout // TODO: to log
-			cmd.Stderr = os.Stderr
+			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.URL.String(), ".")
 			cmd.Dir = dir
-			return cmd.Run()
+			return runCommandLogged(cmd)
 		}
 
 		return err
 	} else if fi != nil && fi.IsDir() {
 		// cache exists, update it
-		cmd := exec.Command("git", "remote", "update")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd := exec.Command("git", "remote", "--verbose", "update")
 		cmd.Dir = dir
-		return cmd.Run()
+		return runCommandLogged(cmd)
 	}
 
 	return fmt.Errorf("cache could not synchronize: %v", repo)
@@ -122,9 +168,8 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 
 	cmd := exec.Command("git", "upload-pack", "--advertise-refs", ".")
 	cmd.Stdout = w
-	cmd.Stderr = os.Stderr
 	cmd.Dir = s.localDir(repo)
-	err := cmd.Run()
+	err := runCommandLogged(cmd)
 	if err != nil {
 		log.Println(err)
 	}
@@ -143,16 +188,15 @@ func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.Read
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
 	cmd.Stdout = w
 	cmd.Stdin = r
-	cmd.Stderr = os.Stderr // TODO: to log
 	cmd.Dir = s.localDir(repo)
-	if err := cmd.Run(); err != nil {
+	if err := runCommandLogged(cmd); err != nil {
 		log.Println(err)
 		return
 	}
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	log.Printf("%s %s %s %v", req.Method, req.URL, req.Proto, req.Header)
+	log.Printf("[request %p] %s %s %v", req, req.Method, req.URL, req.Header)
 
 	if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
 		// mode: ref delivery
@@ -211,7 +255,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	log.Printf("mir starting at %s ...", listen)
+	log.Printf("[server %p] mir starting at %s ...", &s, listen)
+
 	err := http.ListenAndServe(listen, &s)
 	if err != nil {
 		log.Println(err)
