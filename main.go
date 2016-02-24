@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -11,16 +10,15 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"compress/gzip"
 	"net/http"
 	"net/url"
+
+	"github.com/motemen/go-nuts/logwriter"
 )
 
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
-}
+var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
 
 type upstreamRepo struct {
 	URL *url.URL
@@ -75,51 +73,26 @@ func (s *server) repoMutex(repo *upstreamRepo) *sync.RWMutex {
 }
 
 func runCommandLogged(cmd *exec.Cmd) error {
-	var wg sync.WaitGroup
+	logger.Printf("[command %p] %q starting", cmd, cmd.Args)
+	defer logger.Printf("[command %p] %q finished", cmd, cmd.Args)
 
-	outs := []struct {
-		name string
-		w    io.Writer
-		pipe func() (io.ReadCloser, error)
+	for _, s := range []struct {
+		writer *io.Writer
+		name   string
 	}{
-		{"out", cmd.Stdout, cmd.StdoutPipe},
-		{"err", cmd.Stderr, cmd.StderrPipe},
-	}
-
-	log.Printf("[command %p] Running %q dir=%s", cmd, cmd.Args, cmd.Dir)
-
-	for _, o := range outs {
-		if o.w != nil {
-			continue
-		}
-
-		r, err := o.pipe()
-		if err != nil {
-			return err
-		}
-
-		wg.Add(1)
-		go func(name string, r io.Reader) {
-			scanner := bufio.NewScanner(r)
-			for scanner.Scan() {
-				log.Printf("[command %p :: %s] %s", cmd, name, scanner.Text())
+		{&cmd.Stdout, "out"},
+		{&cmd.Stderr, "err"},
+	} {
+		if *s.writer == nil {
+			*s.writer = &logwriter.LogWriter{
+				Logger:     logger,
+				Format:     "[command %p :: %s] %s",
+				FormatArgs: []interface{}{cmd, s.name},
+				Calldepth:  9,
 			}
-			if err := scanner.Err(); err != nil {
-				log.Printf("[command %p !! %s] error=%v", cmd, name, err)
-			}
-			wg.Done()
-		}(o.name, r)
+		}
 	}
-
-	start := time.Now()
-	cmd.Start()
-
-	wg.Wait()
-
-	err := cmd.Wait()
-	log.Printf("[command %p] %q done in %s", cmd, cmd.Args, time.Now().Sub(start))
-
-	return err
+	return cmd.Run()
 }
 
 func (s *server) synchronizeCache(repo *upstreamRepo) error {
@@ -154,9 +127,12 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 }
 
 func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
-	// NOTE: serve remote content and defer synchronization to upload-pack phase?
+	// TODO(motemen): Consider serving remote response and move
+	// synchronizeCache to another goroutine. Note we have to implement each
+	// protocol if we do this, as git does not provide ways to obtain raw
+	// git-upload-pack response.
 	if err := s.synchronizeCache(repo); err != nil {
-		log.Println(err)
+		logger.Println(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -169,12 +145,12 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 	mu.RLock()
 	defer mu.RUnlock()
 
-	cmd := exec.Command("git", "upload-pack", "--advertise-refs", ".")
+	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
 	cmd.Stdout = w
 	cmd.Dir = s.localDir(repo)
 	err := runCommandLogged(cmd)
 	if err != nil {
-		log.Println(err)
+		logger.Println(err)
 	}
 }
 
@@ -193,20 +169,20 @@ func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.Read
 	cmd.Stdin = r
 	cmd.Dir = s.localDir(repo)
 	if err := runCommandLogged(cmd); err != nil {
-		log.Println(err)
+		logger.Println(err)
 		return
 	}
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	log.Printf("[request %p] %s %s %v", req, req.Method, req.URL, req.Header)
+	logger.Printf("[request %p] %s %s %v", req, req.Method, req.URL, req.Header)
 
 	if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
 		// mode: ref delivery
 		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/info/refs")
 		repo, err := s.upstreamRepo(repoPath)
 		if err != nil {
-			log.Println(err)
+			logger.Println(err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -217,7 +193,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/git-upload-pack")
 		repo, err := s.upstreamRepo(repoPath)
 		if err != nil {
-			log.Println(err)
+			logger.Println(err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -227,7 +203,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			var err error
 			r, err = gzip.NewReader(req.Body)
 			if err != nil {
-				log.Println(err)
+				logger.Println(err)
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -258,10 +234,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	log.Printf("[server %p] mir starting at %s ...", &s, listen)
+	logger.Printf("[server %p] mir starting at %s ...", &s, listen)
 
 	err := http.ListenAndServe(listen, &s)
 	if err != nil {
-		log.Println(err)
+		logger.Println(err)
 	}
 }
