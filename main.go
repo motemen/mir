@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -15,7 +17,9 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/motemen/go-nuts/broadcastwriter"
 	"github.com/motemen/go-nuts/logwriter"
+	"gopkg.in/src-d/go-git.v3"
 )
 
 var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
@@ -30,8 +34,19 @@ type server struct {
 
 	repoMutexes struct {
 		sync.Mutex
-		m map[string]sync.RWMutex
+		m map[string]*repoLock
 	}
+}
+
+type repoLock struct {
+	sync.RWMutex
+	w *broadcastwriter.BroadcastWriter
+}
+
+func (l *repoLock) Unlock() {
+	l.w.Close()
+	l.w = broadcastwriter.NewBroadcastWriter()
+	l.RWMutex.Unlock()
 }
 
 func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
@@ -54,25 +69,27 @@ func (s server) localDir(repo *upstreamRepo) string {
 	return filepath.Join(path...)
 }
 
-func (s *server) repoMutex(repo *upstreamRepo) *sync.RWMutex {
+func (s *server) repoMutex(repo *upstreamRepo) *repoLock {
 	s.repoMutexes.Lock()
 	defer s.repoMutexes.Unlock()
 
 	if s.repoMutexes.m == nil {
-		s.repoMutexes.m = map[string]sync.RWMutex{}
+		s.repoMutexes.m = map[string]*repoLock{}
 	}
 
 	repoURL := repo.URL.String()
 	mu, ok := s.repoMutexes.m[repoURL]
 	if !ok {
-		mu = sync.RWMutex{}
+		mu = &repoLock{
+			w: broadcastwriter.NewBroadcastWriter(),
+		}
 		s.repoMutexes.m[repoURL] = mu
 	}
 
-	return &mu
+	return mu
 }
 
-func runCommandLogged(cmd *exec.Cmd) error {
+func runCommandLogged(cmd *exec.Cmd, writer io.Writer) error {
 	logger.Printf("[command %p] %q starting", cmd, cmd.Args)
 	defer logger.Printf("[command %p] %q finished", cmd, cmd.Args)
 
@@ -84,12 +101,17 @@ func runCommandLogged(cmd *exec.Cmd) error {
 		{&cmd.Stderr, "err"},
 	} {
 		if *s.writer == nil {
-			*s.writer = &logwriter.LogWriter{
+			var w io.Writer
+			w = &logwriter.LogWriter{
 				Logger:     logger,
-				Format:     "[command %p :: %s] %s",
+				Format:     "[command %p :: %s] %s", // XXX if the command output contains "\r", the log becomes odd
 				FormatArgs: []interface{}{cmd, s.name},
 				Calldepth:  9,
 			}
+			if writer != nil {
+				w = io.MultiWriter(w, writer)
+			}
+			*s.writer = w
 		}
 	}
 	return cmd.Run()
@@ -112,7 +134,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 
 			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.URL.String(), ".")
 			cmd.Dir = dir
-			return runCommandLogged(cmd)
+			return runCommandLogged(cmd, mu.w)
 		}
 
 		return err
@@ -120,55 +142,64 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 		// cache exists, update it
 		cmd := exec.Command("git", "remote", "--verbose", "update")
 		cmd.Dir = dir
-		return runCommandLogged(cmd)
+		return runCommandLogged(cmd, mu.w)
 	}
 
 	return fmt.Errorf("cache could not synchronize: %v", repo)
 }
 
 func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
-	// TODO(motemen): Consider serving remote response and move
-	// synchronizeCache to another goroutine. Note we have to implement each
-	// protocol if we do this, as git does not provide ways to obtain raw
-	// git-upload-pack response.
-	if err := s.synchronizeCache(repo); err != nil {
+	go s.synchronizeCache(repo)
+
+	remote, err := git.NewRemote(repo.URL.String())
+	if err != nil {
 		logger.Println(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-	fmt.Fprint(w, "001e# service=git-upload-pack\n")
-	fmt.Fprint(w, "0000")
-
-	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
-
-	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
-	cmd.Stdout = w
-	cmd.Dir = s.localDir(repo)
-	err := runCommandLogged(cmd)
-	if err != nil {
+	if err := remote.Connect(); err != nil {
 		logger.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	info := remote.Info()
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+	w.Write(info.Bytes())
 }
 
+// XXX: Wanted to include "git remote update" progress into "git fetch"'s,
+// but it must be interleaved into packfile, so we must finish the negotiation first to do that.
+//
+// To do so, we must have "git remote update" finished ... and it's a dead lock.
 func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.ReadCloser) {
 	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
+
+	// TODO: RLock repo
+	l := mu.w.NewListener()
+	for b := range l {
+		logger.Printf("waiting %q", b)
+	}
+	// mu.RLock()
+	// defer mu.RUnlock()
+
+	clientRequest, err := ioutil.ReadAll(r)
+	r.Close()
+
+	if err != nil {
+		log.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	defer r.Close()
-
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
 	cmd.Stdout = w
-	cmd.Stdin = r
+	cmd.Stdin = bytes.NewBuffer(clientRequest)
 	cmd.Dir = s.localDir(repo)
-	if err := runCommandLogged(cmd); err != nil {
+	if err := runCommandLogged(cmd, nil); err != nil {
+		// TODO(motemen): send error to client
 		logger.Println(err)
 		return
 	}
