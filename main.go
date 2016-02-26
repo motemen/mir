@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha1"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"compress/gzip"
 	"net/http"
@@ -32,9 +36,14 @@ type server struct {
 		sync.Mutex
 		m map[string]sync.RWMutex
 	}
+
+	packCache struct {
+		sync.RWMutex
+		m map[string][]byte
+	}
 }
 
-func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
+func (s *server) upstreamRepo(path string) (*upstreamRepo, error) {
 	if !strings.HasSuffix(path, ".git") {
 		path = path + ".git"
 	}
@@ -46,7 +55,7 @@ func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
 	return &upstreamRepo{URL: u}, nil
 }
 
-func (s server) localDir(repo *upstreamRepo) string {
+func (s *server) localDir(repo *upstreamRepo) string {
 	// TODO(motemen): include protocols (e.g. "https") for completeness
 	// Note that "ssh://user@example.com/foo/bar" and "user@example.com:foo/bar" differs
 	// (git/Documentation/technical/pack-protocol.txt)
@@ -123,7 +132,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 		return runCommandLogged(cmd)
 	}
 
-	return fmt.Errorf("cache could not synchronize: %v", repo)
+	return fmt.Errorf("could not synchronize cache: %v", repo)
 }
 
 func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
@@ -159,19 +168,86 @@ func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.Read
 	mu.RLock()
 	defer mu.RUnlock()
 
+	clientRequest, err := ioutil.ReadAll(r)
+	r.Close()
+
+	if err != nil {
+		logger.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	defer r.Close()
+	if packResponse := s.getPackCache(repo, clientRequest); packResponse != nil {
+		resp := make([]byte, len(packResponse))
+		copy(resp, packResponse)
+
+		message := "[mir] Using cache\n"
+		// 0x02 is the progress information band (see git/Documentation/technical/pack-protocol.txt)
+		progressLine := []byte(fmt.Sprintf("%04x\002%s", 4+1+len(message), message))
+
+		if p := bytes.Index(packResponse, []byte("0008NAK\n")); p != -1 {
+			resp = append(resp[0:p+0x0008], progressLine...)
+			resp = append(resp, packResponse[p+0x0008:]...)
+		} else if p := bytes.Index(packResponse, []byte("0031ACK ")); p != -1 {
+			resp = append(resp[0:p+0x0031], progressLine...)
+			resp = append(resp, packResponse[p+0x0031:]...)
+		}
+
+		w.Write(resp)
+		return
+	}
+
+	var respBody bytes.Buffer
 
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
-	cmd.Stdout = w
-	cmd.Stdin = r
+	cmd.Stdout = &respBody
+	cmd.Stdin = bytes.NewBuffer(clientRequest)
 	cmd.Dir = s.localDir(repo)
 	if err := runCommandLogged(cmd); err != nil {
 		logger.Println(err)
 		return
 	}
+
+	s.setPackCache(repo, clientRequest, respBody.Bytes())
+	io.Copy(w, &respBody)
+}
+
+func (s *server) getPackCache(repo *upstreamRepo, clientRequest []byte) []byte {
+	s.packCache.RLock()
+	defer s.packCache.RUnlock()
+
+	reqDigest := sha1.Sum(clientRequest)
+	key := repo.URL.String() + "\000" + string(reqDigest[:])
+	if s.packCache.m == nil {
+		s.packCache.m = map[string][]byte{}
+	}
+
+	return s.packCache.m[key]
+}
+
+var cacheExpration = time.Second * 100
+
+func (s *server) setPackCache(repo *upstreamRepo, clientRequest []byte, packResponse []byte) {
+	s.packCache.Lock()
+	defer s.packCache.Unlock()
+
+	reqDigest := sha1.Sum(clientRequest)
+	key := repo.URL.String() + "\000" + string(reqDigest[:])
+	if s.packCache.m == nil {
+		s.packCache.m = map[string][]byte{}
+	}
+
+	s.packCache.m[key] = packResponse
+
+	time.AfterFunc(cacheExpration, func() {
+		logger.Printf("cache expired: %s", key)
+		s.packCache.Lock()
+		defer s.packCache.Unlock()
+		delete(s.packCache.m, key)
+	})
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
