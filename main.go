@@ -33,7 +33,7 @@ type server struct {
 	upstream string
 	basePath string
 
-	repoMutexes struct {
+	repoLockes struct {
 		sync.Mutex
 		m map[string]*repoLock
 	}
@@ -97,22 +97,22 @@ func (s *server) localDir(repo *upstreamRepo) string {
 	return filepath.Join(path...)
 }
 
-func (s *server) repoMutex(repo *upstreamRepo) *repoLock {
-	s.repoMutexes.Lock()
-	defer s.repoMutexes.Unlock()
+func (s *server) repoLock(repo *upstreamRepo) *repoLock {
+	s.repoLockes.Lock()
+	defer s.repoLockes.Unlock()
 
-	if s.repoMutexes.m == nil {
-		s.repoMutexes.m = map[string]*repoLock{}
+	if s.repoLockes.m == nil {
+		s.repoLockes.m = map[string]*repoLock{}
 	}
 
 	repoURL := repo.URL.String()
-	mu, ok := s.repoMutexes.m[repoURL]
+	rl, ok := s.repoLockes.m[repoURL]
 	if !ok {
-		mu = &repoLock{}
-		s.repoMutexes.m[repoURL] = mu
+		rl = &repoLock{}
+		s.repoLockes.m[repoURL] = rl
 	}
 
-	return mu
+	return rl
 }
 
 func runCommandLogged(cmd *exec.Cmd) error {
@@ -139,12 +139,12 @@ func runCommandLogged(cmd *exec.Cmd) error {
 }
 
 func (s *server) synchronizeCache(repo *upstreamRepo) error {
-	mu := s.repoMutex(repo)
-	mu.Lock()
-	defer mu.Unlock()
+	rl := s.repoLock(repo)
+	rl.Lock()
+	defer rl.Unlock()
 
-	if time.Now().Before(mu.lastSynchronized.Add(s.refsFreshFor)) {
-		logger.Printf("[repo %s] Refs last synchronized at %s, not synchronizing repo", repo.URL, mu.lastSynchronized)
+	if time.Now().Before(rl.lastSynchronized.Add(s.refsFreshFor)) {
+		logger.Printf("[repo %s] Refs last synchronized at %s, not synchronizing repo", repo.URL, rl.lastSynchronized)
 		return nil
 	}
 
@@ -162,7 +162,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 			cmd.Dir = dir
 			err := runCommandLogged(cmd)
 			if err == nil {
-				mu.lastSynchronized = time.Now()
+				rl.lastSynchronized = time.Now()
 			}
 			return err
 		}
@@ -175,7 +175,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 
 		err := runCommandLogged(cmd)
 		if err == nil {
-			mu.lastSynchronized = time.Now()
+			rl.lastSynchronized = time.Now()
 		}
 		return err
 	}
@@ -198,9 +198,9 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 	fmt.Fprint(w, "001e# service=git-upload-pack\n")
 	fmt.Fprint(w, "0000")
 
-	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
+	rl := s.repoLock(repo)
+	rl.RLock()
+	defer rl.RUnlock()
 
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
 	cmd.Stdout = w
@@ -212,9 +212,9 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 }
 
 func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.ReadCloser) {
-	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
+	rl := s.repoLock(repo)
+	rl.RLock()
+	defer rl.RUnlock()
 
 	clientRequest, err := ioutil.ReadAll(r)
 	r.Close()
