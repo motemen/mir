@@ -34,13 +34,19 @@ type server struct {
 
 	repoMutexes struct {
 		sync.Mutex
-		m map[string]sync.RWMutex
+		m map[string]*repoLock
 	}
 
 	packCache struct {
 		sync.RWMutex
 		m map[string][]byte
 	}
+	refsFreshFor time.Duration
+}
+
+type repoLock struct {
+	sync.RWMutex
+	lastSynchronized time.Time
 }
 
 func (s *server) upstreamRepo(path string) (*upstreamRepo, error) {
@@ -63,22 +69,22 @@ func (s *server) localDir(repo *upstreamRepo) string {
 	return filepath.Join(path...)
 }
 
-func (s *server) repoMutex(repo *upstreamRepo) *sync.RWMutex {
+func (s *server) repoMutex(repo *upstreamRepo) *repoLock {
 	s.repoMutexes.Lock()
 	defer s.repoMutexes.Unlock()
 
 	if s.repoMutexes.m == nil {
-		s.repoMutexes.m = map[string]sync.RWMutex{}
+		s.repoMutexes.m = map[string]*repoLock{}
 	}
 
 	repoURL := repo.URL.String()
 	mu, ok := s.repoMutexes.m[repoURL]
 	if !ok {
-		mu = sync.RWMutex{}
+		mu = &repoLock{}
 		s.repoMutexes.m[repoURL] = mu
 	}
 
-	return &mu
+	return mu
 }
 
 func runCommandLogged(cmd *exec.Cmd) error {
@@ -109,6 +115,11 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 	mu.Lock()
 	defer mu.Unlock()
 
+	if time.Now().Before(mu.lastSynchronized.Add(s.refsFreshFor)) {
+		logger.Printf("[repo %s] Refs last synchronized at %s, not synchronizing repo", repo.URL, mu.lastSynchronized)
+		return nil
+	}
+
 	dir := s.localDir(repo)
 
 	fi, err := os.Stat(dir)
@@ -121,7 +132,11 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 
 			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.URL.String(), ".")
 			cmd.Dir = dir
-			return runCommandLogged(cmd)
+			err := runCommandLogged(cmd)
+			if err == nil {
+				mu.lastSynchronized = time.Now()
+			}
+			return err
 		}
 
 		return err
@@ -129,7 +144,12 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 		// cache exists, update it
 		cmd := exec.Command("git", "remote", "--verbose", "update")
 		cmd.Dir = dir
-		return runCommandLogged(cmd)
+
+		err := runCommandLogged(cmd)
+		if err == nil {
+			mu.lastSynchronized = time.Now()
+		}
+		return err
 	}
 
 	return fmt.Errorf("could not synchronize cache: %v", repo)
@@ -309,6 +329,8 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+
+	s.refsFreshFor = 5 * time.Second // TODO make configurable, say "--refs-fresh-for="
 
 	logger.Printf("[server %p] mir starting at %s ...", &s, listen)
 
