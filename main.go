@@ -19,13 +19,14 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/golang/groupcache/lru"
 	"github.com/motemen/go-nuts/logwriter"
 )
 
 var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
 
 type upstreamRepo struct {
-	URL *url.URL
+	URL *url.URL // TODO: be a string
 }
 
 type server struct {
@@ -37,11 +38,38 @@ type server struct {
 		m map[string]*repoLock
 	}
 
-	packCache struct {
-		sync.RWMutex
-		m map[string][]byte
-	}
+	packCache    packCache
 	refsFreshFor time.Duration
+}
+
+type packCache struct {
+	sync.Mutex
+	*lru.Cache
+}
+
+func (c *packCache) key(repo *upstreamRepo, clientRequest []byte) string {
+	reqDigest := sha1.Sum(clientRequest)
+	return repo.URL.String() + "\000" + string(reqDigest[:])
+}
+
+func (c *packCache) Get(repo *upstreamRepo, clientRequest []byte) []byte {
+	c.Lock()
+	defer c.Unlock()
+
+	key := c.key(repo, clientRequest)
+	if v, ok := c.Cache.Get(key); ok {
+		return v.([]byte)
+	} else {
+		return nil
+	}
+}
+
+func (c *packCache) Add(repo *upstreamRepo, clientRequest []byte, data []byte) {
+	c.Lock()
+	defer c.Unlock()
+
+	key := c.key(repo, clientRequest)
+	c.Cache.Add(key, data)
 }
 
 type repoLock struct {
@@ -200,11 +228,11 @@ func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.Read
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	if packResponse := s.getPackCache(repo, clientRequest); packResponse != nil {
+	if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
 		resp := make([]byte, len(packResponse))
 		copy(resp, packResponse)
 
-		message := "[mir] Using cache\n"
+		message := "[mir] Using cached pack\n"
 		// 0x02 is the progress information band (see git/Documentation/technical/pack-protocol.txt)
 		progressLine := []byte(fmt.Sprintf("%04x\002%s", 4+1+len(message), message))
 
@@ -231,43 +259,8 @@ func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.Read
 		return
 	}
 
-	s.setPackCache(repo, clientRequest, respBody.Bytes())
+	s.packCache.Add(repo, clientRequest, respBody.Bytes())
 	io.Copy(w, &respBody)
-}
-
-func (s *server) getPackCache(repo *upstreamRepo, clientRequest []byte) []byte {
-	s.packCache.RLock()
-	defer s.packCache.RUnlock()
-
-	reqDigest := sha1.Sum(clientRequest)
-	key := repo.URL.String() + "\000" + string(reqDigest[:])
-	if s.packCache.m == nil {
-		s.packCache.m = map[string][]byte{}
-	}
-
-	return s.packCache.m[key]
-}
-
-var cacheExpration = time.Second * 100
-
-func (s *server) setPackCache(repo *upstreamRepo, clientRequest []byte, packResponse []byte) {
-	s.packCache.Lock()
-	defer s.packCache.Unlock()
-
-	reqDigest := sha1.Sum(clientRequest)
-	key := repo.URL.String() + "\000" + string(reqDigest[:])
-	if s.packCache.m == nil {
-		s.packCache.m = map[string][]byte{}
-	}
-
-	s.packCache.m[key] = packResponse
-
-	time.AfterFunc(cacheExpration, func() {
-		logger.Printf("cache expired: %s", key)
-		s.packCache.Lock()
-		defer s.packCache.Unlock()
-		delete(s.packCache.m, key)
-	})
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -331,6 +324,7 @@ func main() {
 	}
 
 	s.refsFreshFor = 5 * time.Second // TODO make configurable, say "--refs-fresh-for="
+	s.packCache.Cache = lru.New(20)  // TODO make configurable, say "--num-pack-cache="
 
 	logger.Printf("[server %p] mir starting at %s ...", &s, listen)
 
