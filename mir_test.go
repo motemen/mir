@@ -3,34 +3,46 @@ package main
 import "testing"
 
 import (
+	"fmt"
 	"io/ioutil"
+	"net"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 )
 
-func TestMir(t *testing.T) {
+func TestMir_Smoke(t *testing.T) {
 	upstreamBase, err := ioutil.TempDir("", "mir-test-upstream")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer os.RemoveAll(upstreamBase)
 
 	workTreeBase, err := ioutil.TempDir("", "mir-test-worktree")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer os.RemoveAll(workTreeBase)
 
 	mirBase, err := ioutil.TempDir("", "mir-test-base")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer os.RemoveAll(mirBase)
 
-	gitDaemon := exec.Command("git", "daemon", "--verbose", "--export-all", "--base-path="+upstreamBase, "--reuseaddr")
+	gitPort, err := emptyPort()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gitDaemon := exec.Command("git", "daemon", "--verbose", "--export-all", "--base-path="+upstreamBase, "--port="+fmt.Sprintf("%d", gitPort), "--reuseaddr")
 	gitDaemon.Stderr = os.Stderr
 	defer func() {
 		gitDaemon.Process.Signal(os.Interrupt)
 		gitDaemon.Wait()
 	}()
+
 	err = gitDaemon.Start()
 	if err != nil {
 		t.Fatal(err)
@@ -49,23 +61,33 @@ func TestMir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mir := exec.Command("./mir", "-upstream", "git://localhost/", "-base-path", mirBase, "-listen", "localhost:9280")
-	mir.Stderr = os.Stderr
-
-	defer func() {
-		mir.Process.Kill()
-		mir.Wait()
-	}()
-	err = mir.Start()
-	if err != nil {
-		t.Fatal(err)
+	mir := server{
+		basePath: mirBase,
+		upstream: fmt.Sprintf("git://localhost:%d/", gitPort),
 	}
 
-	cmd = exec.Command("git", "clone", "http://localhost:9280/foo/bar.git")
+	s := httptest.NewServer(&mir)
+	defer s.Close()
+
+	cmd = exec.Command("git", "clone", s.URL+"/foo/bar.git")
 	cmd.Dir = workTreeBase
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func emptyPort() (int, error) {
+	l, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
+	}
+
+	err = l.Close()
+	if err != nil {
+		return 0, err
+	}
+
+	return l.Addr().(*net.TCPAddr).Port, nil
 }
