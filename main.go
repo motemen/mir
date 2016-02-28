@@ -13,63 +13,55 @@ import (
 
 	"compress/gzip"
 	"net/http"
-	"net/url"
 
 	"github.com/motemen/go-nuts/logwriter"
 )
 
 var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
 
-type upstreamRepo struct {
-	URL *url.URL
+// repository represents a repository that mir synchronizes.
+// A *repository instance is unique by its path (under a *server),
+// so calling its Lock() makes sense.
+type repository struct {
+	path     string
+	upstream string
+	sync.RWMutex
 }
 
 type server struct {
 	upstream string
 	basePath string
 
-	repoMutexes struct {
+	repos struct {
 		sync.Mutex
-		m map[string]sync.RWMutex
+		m map[string]*repository
 	}
 }
 
-func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
-	if !strings.HasSuffix(path, ".git") {
-		path = path + ".git"
-	}
-	u, err := url.Parse(s.upstream + path)
-	if err != nil {
-		return nil, err
-	}
-
-	return &upstreamRepo{URL: u}, nil
-}
-
-func (s server) localDir(repo *upstreamRepo) string {
-	// TODO(motemen): include protocols (e.g. "https") for completeness
-	// Note that "ssh://user@example.com/foo/bar" and "user@example.com:foo/bar" differs
-	// (git/Documentation/technical/pack-protocol.txt)
-	path := append([]string{s.basePath, repo.URL.Host}, strings.Split(repo.URL.Path, "/")...)
+func (s server) localDir(repository *repository) string {
+	// TODO(motemen): escape special characters
+	path := append([]string{s.basePath}, strings.Split(repository.path, "/")...)
 	return filepath.Join(path...)
 }
 
-func (s *server) repoMutex(repo *upstreamRepo) *sync.RWMutex {
-	s.repoMutexes.Lock()
-	defer s.repoMutexes.Unlock()
+func (s *server) repository(repoPath string) *repository {
+	s.repos.Lock()
+	defer s.repos.Unlock()
 
-	if s.repoMutexes.m == nil {
-		s.repoMutexes.m = map[string]sync.RWMutex{}
+	if s.repos.m == nil {
+		s.repos.m = map[string]*repository{}
 	}
 
-	repoURL := repo.URL.String()
-	mu, ok := s.repoMutexes.m[repoURL]
+	repo, ok := s.repos.m[repoPath]
 	if !ok {
-		mu = sync.RWMutex{}
-		s.repoMutexes.m[repoURL] = mu
+		repo = &repository{
+			path:     repoPath,
+			upstream: s.upstream + repoPath,
+		}
+		s.repos.m[repoPath] = repo
 	}
 
-	return &mu
+	return repo
 }
 
 func runCommandLogged(cmd *exec.Cmd) error {
@@ -95,10 +87,9 @@ func runCommandLogged(cmd *exec.Cmd) error {
 	return cmd.Run()
 }
 
-func (s *server) synchronizeCache(repo *upstreamRepo) error {
-	mu := s.repoMutex(repo)
-	mu.Lock()
-	defer mu.Unlock()
+func (s *server) synchronizeCache(repo *repository) error {
+	repo.Lock()
+	defer repo.Unlock()
 
 	dir := s.localDir(repo)
 
@@ -110,7 +101,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 				return err
 			}
 
-			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.URL.String(), ".")
+			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.upstream, ".")
 			cmd.Dir = dir
 			return runCommandLogged(cmd)
 		}
@@ -118,6 +109,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 		return err
 	} else if fi != nil && fi.IsDir() {
 		// cache exists, update it
+		// TODO(motemen): check the directory is a valid git repository
 		cmd := exec.Command("git", "remote", "--verbose", "update")
 		cmd.Dir = dir
 		return runCommandLogged(cmd)
@@ -126,7 +118,7 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 	return fmt.Errorf("cache could not synchronize: %v", repo)
 }
 
-func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
+func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 	// TODO(motemen): Consider serving remote response and move
 	// synchronizeCache to another goroutine. Note we have to implement each
 	// protocol if we do this, as git does not provide ways to obtain raw
@@ -141,9 +133,8 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 	fmt.Fprint(w, "001e# service=git-upload-pack\n")
 	fmt.Fprint(w, "0000")
 
-	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
+	repo.RLock()
+	defer repo.RUnlock()
 
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
 	cmd.Stdout = w
@@ -154,10 +145,9 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 	}
 }
 
-func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.ReadCloser) {
-	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
+func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCloser) {
+	repo.RLock()
+	defer repo.RUnlock()
 
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -180,23 +170,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
 		// mode: ref delivery
 		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/info/refs")
-		repo, err := s.upstreamRepo(repoPath)
-		if err != nil {
-			logger.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		repo := s.repository(repoPath)
 
 		s.advertiseRefs(repo, w)
 	} else if req.Method == "POST" && strings.HasSuffix(req.URL.Path, "/git-upload-pack") {
 		// mode: upload-pack
 		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/git-upload-pack")
-		repo, err := s.upstreamRepo(repoPath)
-		if err != nil {
-			logger.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		repo := s.repository(repoPath)
 
 		r := req.Body
 		if req.Header.Get("Content-Encoding") == "gzip" {
