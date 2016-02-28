@@ -13,6 +13,9 @@ import (
 )
 
 func TestMir_Smoke(t *testing.T) {
+	os.Setenv("GIT_AUTHOR_NAME", "test")
+	os.Setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+
 	upstreamBase, err := ioutil.TempDir("", "mir-test-upstream")
 	if err != nil {
 		t.Fatal(err)
