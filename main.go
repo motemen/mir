@@ -23,8 +23,9 @@ var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicrosecon
 // A *repository instance is unique by its path (under a *server),
 // so calling its Lock() makes sense.
 type repository struct {
-	path     string
-	upstream string
+	path        string
+	upstreamURL string
+	localDir    string
 	sync.RWMutex
 }
 
@@ -38,12 +39,6 @@ type server struct {
 	}
 }
 
-func (s server) localDir(repository *repository) string {
-	// TODO(motemen): escape special characters
-	path := append([]string{s.basePath}, strings.Split(repository.path, "/")...)
-	return filepath.Join(path...)
-}
-
 func (s *server) repository(repoPath string) *repository {
 	s.repos.Lock()
 	defer s.repos.Unlock()
@@ -55,8 +50,10 @@ func (s *server) repository(repoPath string) *repository {
 	repo, ok := s.repos.m[repoPath]
 	if !ok {
 		repo = &repository{
-			path:     repoPath,
-			upstream: s.upstream + repoPath,
+			path:        repoPath,
+			upstreamURL: s.upstream + repoPath,
+			// TODO(motemen): escape special characters
+			localDir: filepath.Join(append([]string{s.basePath}, strings.Split(repoPath, "/")...)...),
 		}
 		s.repos.m[repoPath] = repo
 	}
@@ -91,18 +88,16 @@ func (s *server) synchronizeCache(repo *repository) error {
 	repo.Lock()
 	defer repo.Unlock()
 
-	dir := s.localDir(repo)
-
-	fi, err := os.Stat(dir)
+	fi, err := os.Stat(repo.localDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// cache does not exist, so initialize one (may take long)
-			if err := os.MkdirAll(dir, 0777); err != nil {
+			if err := os.MkdirAll(repo.localDir, 0777); err != nil {
 				return err
 			}
 
-			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.upstream, ".")
-			cmd.Dir = dir
+			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.upstreamURL, ".")
+			cmd.Dir = repo.localDir
 			return runCommandLogged(cmd)
 		}
 
@@ -111,7 +106,7 @@ func (s *server) synchronizeCache(repo *repository) error {
 		// cache exists, update it
 		// TODO(motemen): check the directory is a valid git repository
 		cmd := exec.Command("git", "remote", "--verbose", "update")
-		cmd.Dir = dir
+		cmd.Dir = repo.localDir
 		return runCommandLogged(cmd)
 	}
 
@@ -138,7 +133,7 @@ func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
 	cmd.Stdout = w
-	cmd.Dir = s.localDir(repo)
+	cmd.Dir = repo.localDir
 	err := runCommandLogged(cmd)
 	if err != nil {
 		logger.Println(err)
@@ -157,7 +152,7 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
 	cmd.Stdout = w
 	cmd.Stdin = r
-	cmd.Dir = s.localDir(repo)
+	cmd.Dir = repo.localDir
 	if err := runCommandLogged(cmd); err != nil {
 		logger.Println(err)
 		return
