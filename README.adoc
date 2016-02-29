@@ -7,13 +7,19 @@ Usage
 -----
 
 ----
-mir -listen=<addr> -upstream=<url> -base-path=<path>
+mir -upstream=<url> -base-path=<path> [-listen=<addr>]
 ----
 
 For example:
 
 ----
-mir -listen=:8080 -upstream=https://github.com/ -base-path=/var/lib/mir/cache
+mir -upstream=https://github.com/ -base-path=/var/lib/mir/repos -listen=:8080
+----
+
+Then use it as an HTTP Git server.
+
+----
+$ git clone http://<host>:8080/motemen/mir.git
 ----
 
 Description
