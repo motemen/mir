@@ -1,0 +1,34 @@
+box: tcnksm/gox
+build:
+  steps:
+    - setup-go-workspace
+
+    - script:
+        name: go get
+        code: |
+          go get
+
+    - script:
+        name: go build
+        code: |
+          go build ./...
+
+    - script:
+        name: go test
+        code: |
+          go test -v ./...
+          go test -v -race ./...
+    - wercker/gox:
+        os: linux
+        arch: amd64
+        output: '{{.Dir}}_{{.OS}}_{{.Arch}}/{{.Dir}}'
+        dest: $WERCKER_OUTPUT_DIR/pkg
+    - tcnksm/zip:
+        input: $WERCKER_OUTPUT_DIR/pkg
+        output: $WERCKER_OUTPUT_DIR/dist
+deploy:
+  steps:
+    - tcnksm/ghr:
+        token: $GITHUB_TOKEN
+        input: dist
+        replace: true
