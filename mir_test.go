@@ -12,6 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/golang/groupcache/lru"
 )
 
 func TestMir_Smoke(t *testing.T) {
@@ -89,9 +92,11 @@ func TestMir_Smoke(t *testing.T) {
 	}
 
 	mir := server{
-		basePath: mirBase,
-		upstream: fmt.Sprintf("git://localhost:%d/", gitPort),
+		basePath:     mirBase,
+		upstream:     fmt.Sprintf("git://localhost:%d/", gitPort),
+		refsFreshFor: 5 * time.Second,
 	}
+	mir.packCache.Cache = lru.New(20)
 
 	s := httptest.NewServer(&mir)
 	defer s.Close()
