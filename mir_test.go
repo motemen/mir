@@ -13,9 +13,6 @@ import (
 )
 
 func TestMir_Smoke(t *testing.T) {
-	os.Setenv("GIT_COMMITTER_NAME", "test")
-	os.Setenv("GIT_COMMITTER_EMAIL", "test@example.com")
-
 	upstreamBase, err := ioutil.TempDir("", "mir-test-upstream")
 	if err != nil {
 		t.Fatal(err)
@@ -59,6 +56,13 @@ func TestMir_Smoke(t *testing.T) {
 
 	cmd := exec.Command("git", "--work-tree", ".", "--git-dir", repoDir, "commit", "--allow-empty", "-m", "msg")
 	cmd.Stderr = os.Stderr
+	cmd.Env = []string{
+		"GIT_AUTHOR_NAME=test",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test",
+		"GIT_COMMITTER_EMAIL=test@example.com",
+	}
+
 	err = cmd.Run()
 	if err != nil {
 		t.Fatal(err)
