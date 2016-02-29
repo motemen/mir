@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -17,13 +18,98 @@ import (
 	"github.com/golang/groupcache/lru"
 )
 
-func TestMir_Smoke(t *testing.T) {
-	upstreamBase, err := ioutil.TempDir("", "mir-test-upstream")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(upstreamBase)
+var gitDaemon *gitDaemonSpec
 
+type gitDaemonSpec struct {
+	basePath string
+	port     int
+	cmd      *exec.Cmd
+}
+
+func (d gitDaemonSpec) cleanup() {
+	os.RemoveAll(d.basePath)
+	d.cmd.Process.Signal(os.Interrupt)
+	d.cmd.Wait()
+}
+
+func (d gitDaemonSpec) addRepo(path string) (repo upstreamRepo, err error) {
+	repo = upstreamRepo(filepath.Join(d.basePath, path+".git"))
+	err = exec.Command("git", "init", "--bare", string(repo)).Run()
+	if err != nil {
+		return
+	}
+	err = repo.addNewCommit()
+	return
+}
+
+type upstreamRepo string
+
+func (r upstreamRepo) addNewCommit() error {
+	cmd := exec.Command("git", "--work-tree", ".", "--git-dir", string(r), "commit", "--allow-empty", "-m", "msg")
+	cmd.Stderr = os.Stderr
+	cmd.Env = []string{
+		"GIT_AUTHOR_NAME=test",
+		"GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test",
+		"GIT_COMMITTER_EMAIL=test@example.com",
+	}
+
+	return cmd.Run()
+}
+
+func startGitDaemon() (daemon *gitDaemonSpec, err error) {
+	d := gitDaemonSpec{}
+
+	d.basePath, err = ioutil.TempDir("", "mir-test-daemon-base")
+	if err != nil {
+		return
+	}
+
+	d.port, err = emptyPort()
+	if err != nil {
+		return
+	}
+
+	d.cmd = exec.Command("git", "daemon", "--verbose", "--export-all", "--base-path="+d.basePath, "--port="+fmt.Sprintf("%d", d.port), "--reuseaddr")
+
+	e, err := d.cmd.StderrPipe()
+	if err != nil {
+		return
+	}
+
+	err = d.cmd.Start()
+	if err != nil {
+		return
+	}
+
+	// Wait for git-daemon to start
+	s := bufio.NewScanner(e)
+	for s.Scan() {
+		if strings.HasSuffix(s.Text(), "Ready to rumble") {
+			break
+		}
+	}
+
+	err = s.Err()
+	if err != nil {
+		return
+	}
+
+	return &d, nil
+}
+
+func TestMain(m *testing.M) {
+	var err error
+	gitDaemon, err = startGitDaemon()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer gitDaemon.cleanup()
+
+	os.Exit(m.Run())
+}
+
+func TestMir_Smoke(t *testing.T) {
 	workTreeBase, err := ioutil.TempDir("", "mir-test-worktree")
 	if err != nil {
 		t.Fatal(err)
@@ -36,64 +122,14 @@ func TestMir_Smoke(t *testing.T) {
 	}
 	defer os.RemoveAll(mirBase)
 
-	gitPort, err := emptyPort()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	gitDaemon := exec.Command("git", "daemon", "--verbose", "--export-all", "--base-path="+upstreamBase, "--port="+fmt.Sprintf("%d", gitPort), "--reuseaddr")
-	e, err := gitDaemon.StderrPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = gitDaemon.Start()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	{
-		// Wait for git-daemon to start
-		gitDaemonErrLines := bufio.NewScanner(e)
-		for gitDaemonErrLines.Scan() {
-			if strings.HasSuffix(gitDaemonErrLines.Text(), "Ready to rumble") {
-				break
-			}
-		}
-		err := gitDaemonErrLines.Err()
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	defer func() {
-		gitDaemon.Process.Signal(os.Interrupt)
-		gitDaemon.Wait()
-	}()
-
-	repoDir := filepath.Join(upstreamBase, "foo", "bar.git")
-	err = exec.Command("git", "init", "--bare", repoDir).Run()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cmd := exec.Command("git", "--work-tree", ".", "--git-dir", repoDir, "commit", "--allow-empty", "-m", "msg")
-	cmd.Stderr = os.Stderr
-	cmd.Env = []string{
-		"GIT_AUTHOR_NAME=test",
-		"GIT_AUTHOR_EMAIL=test@example.com",
-		"GIT_COMMITTER_NAME=test",
-		"GIT_COMMITTER_EMAIL=test@example.com",
-	}
-
-	err = cmd.Run()
+	_, err = gitDaemon.addRepo("foo/bar")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	mir := server{
 		basePath:     mirBase,
-		upstream:     fmt.Sprintf("git://localhost:%d/", gitPort),
+		upstream:     fmt.Sprintf("git://localhost:%d/", gitDaemon.port),
 		refsFreshFor: 5 * time.Second,
 	}
 	mir.packCache.Cache = lru.New(20)
@@ -101,7 +137,7 @@ func TestMir_Smoke(t *testing.T) {
 	s := httptest.NewServer(&mir)
 	defer s.Close()
 
-	cmd = exec.Command("git", "clone", s.URL+"/foo/bar.git")
+	cmd := exec.Command("git", "clone", s.URL+"/foo/bar.git")
 	cmd.Dir = workTreeBase
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
