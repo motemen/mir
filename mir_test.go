@@ -3,6 +3,7 @@ package main
 import "testing"
 
 import (
+	"bufio"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 func TestMir_Smoke(t *testing.T) {
@@ -37,16 +39,34 @@ func TestMir_Smoke(t *testing.T) {
 	}
 
 	gitDaemon := exec.Command("git", "daemon", "--verbose", "--export-all", "--base-path="+upstreamBase, "--port="+fmt.Sprintf("%d", gitPort), "--reuseaddr")
-	gitDaemon.Stderr = os.Stderr
-	defer func() {
-		gitDaemon.Process.Signal(os.Interrupt)
-		gitDaemon.Wait()
-	}()
+	e, err := gitDaemon.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	err = gitDaemon.Start()
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	{
+		// Wait for git-daemon to start
+		gitDaemonErrLines := bufio.NewScanner(e)
+		for gitDaemonErrLines.Scan() {
+			if strings.HasSuffix(gitDaemonErrLines.Text(), "Ready to rumble") {
+				break
+			}
+		}
+		err := gitDaemonErrLines.Err()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	defer func() {
+		gitDaemon.Process.Signal(os.Interrupt)
+		gitDaemon.Wait()
+	}()
 
 	repoDir := filepath.Join(upstreamBase, "foo", "bar.git")
 	err = exec.Command("git", "init", "--bare", repoDir).Run()
