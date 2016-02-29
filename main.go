@@ -1,40 +1,83 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha1"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"compress/gzip"
 	"net/http"
 	"net/url"
 
+	"github.com/golang/groupcache/lru"
 	"github.com/motemen/go-nuts/logwriter"
 )
 
 var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
 
 type upstreamRepo struct {
-	URL *url.URL
+	URL *url.URL // TODO: be a string
 }
 
 type server struct {
 	upstream string
 	basePath string
 
-	repoMutexes struct {
+	repoLockes struct {
 		sync.Mutex
-		m map[string]sync.RWMutex
+		m map[string]*repoLock
+	}
+
+	packCache    packCache
+	refsFreshFor time.Duration
+}
+
+type packCache struct {
+	sync.Mutex
+	*lru.Cache
+}
+
+func (c *packCache) key(repo *upstreamRepo, clientRequest []byte) string {
+	reqDigest := sha1.Sum(clientRequest)
+	return repo.URL.String() + "\000" + string(reqDigest[:])
+}
+
+func (c *packCache) Get(repo *upstreamRepo, clientRequest []byte) []byte {
+	c.Lock()
+	defer c.Unlock()
+
+	key := c.key(repo, clientRequest)
+	if v, ok := c.Cache.Get(key); ok {
+		return v.([]byte)
+	} else {
+		return nil
 	}
 }
 
-func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
+func (c *packCache) Add(repo *upstreamRepo, clientRequest []byte, data []byte) {
+	c.Lock()
+	defer c.Unlock()
+
+	key := c.key(repo, clientRequest)
+	c.Cache.Add(key, data)
+}
+
+type repoLock struct {
+	sync.RWMutex
+	lastSynchronized time.Time
+}
+
+func (s *server) upstreamRepo(path string) (*upstreamRepo, error) {
 	if !strings.HasSuffix(path, ".git") {
 		path = path + ".git"
 	}
@@ -46,7 +89,7 @@ func (s server) upstreamRepo(path string) (*upstreamRepo, error) {
 	return &upstreamRepo{URL: u}, nil
 }
 
-func (s server) localDir(repo *upstreamRepo) string {
+func (s *server) localDir(repo *upstreamRepo) string {
 	// TODO(motemen): include protocols (e.g. "https") for completeness
 	// Note that "ssh://user@example.com/foo/bar" and "user@example.com:foo/bar" differs
 	// (git/Documentation/technical/pack-protocol.txt)
@@ -54,22 +97,22 @@ func (s server) localDir(repo *upstreamRepo) string {
 	return filepath.Join(path...)
 }
 
-func (s *server) repoMutex(repo *upstreamRepo) *sync.RWMutex {
-	s.repoMutexes.Lock()
-	defer s.repoMutexes.Unlock()
+func (s *server) repoLock(repo *upstreamRepo) *repoLock {
+	s.repoLockes.Lock()
+	defer s.repoLockes.Unlock()
 
-	if s.repoMutexes.m == nil {
-		s.repoMutexes.m = map[string]sync.RWMutex{}
+	if s.repoLockes.m == nil {
+		s.repoLockes.m = map[string]*repoLock{}
 	}
 
 	repoURL := repo.URL.String()
-	mu, ok := s.repoMutexes.m[repoURL]
+	rl, ok := s.repoLockes.m[repoURL]
 	if !ok {
-		mu = sync.RWMutex{}
-		s.repoMutexes.m[repoURL] = mu
+		rl = &repoLock{}
+		s.repoLockes.m[repoURL] = rl
 	}
 
-	return &mu
+	return rl
 }
 
 func runCommandLogged(cmd *exec.Cmd) error {
@@ -96,9 +139,14 @@ func runCommandLogged(cmd *exec.Cmd) error {
 }
 
 func (s *server) synchronizeCache(repo *upstreamRepo) error {
-	mu := s.repoMutex(repo)
-	mu.Lock()
-	defer mu.Unlock()
+	rl := s.repoLock(repo)
+	rl.Lock()
+	defer rl.Unlock()
+
+	if time.Now().Before(rl.lastSynchronized.Add(s.refsFreshFor)) {
+		logger.Printf("[repo %s] Refs last synchronized at %s, not synchronizing repo", repo.URL, rl.lastSynchronized)
+		return nil
+	}
 
 	dir := s.localDir(repo)
 
@@ -112,7 +160,11 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 
 			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.URL.String(), ".")
 			cmd.Dir = dir
-			return runCommandLogged(cmd)
+			err := runCommandLogged(cmd)
+			if err == nil {
+				rl.lastSynchronized = time.Now()
+			}
+			return err
 		}
 
 		return err
@@ -120,10 +172,15 @@ func (s *server) synchronizeCache(repo *upstreamRepo) error {
 		// cache exists, update it
 		cmd := exec.Command("git", "remote", "--verbose", "update")
 		cmd.Dir = dir
-		return runCommandLogged(cmd)
+
+		err := runCommandLogged(cmd)
+		if err == nil {
+			rl.lastSynchronized = time.Now()
+		}
+		return err
 	}
 
-	return fmt.Errorf("cache could not synchronize: %v", repo)
+	return fmt.Errorf("could not synchronize cache: %v", repo)
 }
 
 func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
@@ -141,9 +198,9 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 	fmt.Fprint(w, "001e# service=git-upload-pack\n")
 	fmt.Fprint(w, "0000")
 
-	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
+	rl := s.repoLock(repo)
+	rl.RLock()
+	defer rl.RUnlock()
 
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
 	cmd.Stdout = w
@@ -155,23 +212,55 @@ func (s *server) advertiseRefs(repo *upstreamRepo, w http.ResponseWriter) {
 }
 
 func (s *server) uploadPack(repo *upstreamRepo, w http.ResponseWriter, r io.ReadCloser) {
-	mu := s.repoMutex(repo)
-	mu.RLock()
-	defer mu.RUnlock()
+	rl := s.repoLock(repo)
+	rl.RLock()
+	defer rl.RUnlock()
+
+	clientRequest, err := ioutil.ReadAll(r)
+	r.Close()
+
+	if err != nil {
+		logger.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	defer r.Close()
+	if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
+		resp := make([]byte, len(packResponse))
+		copy(resp, packResponse)
+
+		message := "[mir] Using cached pack\n"
+		// 0x02 is the progress information band (see git/Documentation/technical/pack-protocol.txt)
+		progressLine := []byte(fmt.Sprintf("%04x\002%s", 4+1+len(message), message))
+
+		if p := bytes.Index(packResponse, []byte("0008NAK\n")); p != -1 {
+			resp = append(resp[0:p+0x0008], progressLine...)
+			resp = append(resp, packResponse[p+0x0008:]...)
+		} else if p := bytes.Index(packResponse, []byte("0031ACK ")); p != -1 {
+			resp = append(resp[0:p+0x0031], progressLine...)
+			resp = append(resp, packResponse[p+0x0031:]...)
+		}
+
+		w.Write(resp)
+		return
+	}
+
+	var respBody bytes.Buffer
 
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
-	cmd.Stdout = w
-	cmd.Stdin = r
+	cmd.Stdout = &respBody
+	cmd.Stdin = bytes.NewBuffer(clientRequest)
 	cmd.Dir = s.localDir(repo)
 	if err := runCommandLogged(cmd); err != nil {
 		logger.Println(err)
 		return
 	}
+
+	s.packCache.Add(repo, clientRequest, respBody.Bytes())
+	io.Copy(w, &respBody)
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -233,6 +322,9 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+
+	s.refsFreshFor = 5 * time.Second // TODO make configurable, say "--refs-fresh-for="
+	s.packCache.Cache = lru.New(20)  // TODO make configurable, say "--num-pack-cache="
 
 	logger.Printf("[server %p] mir starting at %s ...", &s, listen)
 
