@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"flag"
@@ -19,7 +20,6 @@ import (
 	"net/http"
 
 	"github.com/golang/groupcache/lru"
-	"github.com/motemen/go-nuts/logwriter"
 )
 
 var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
@@ -100,32 +100,61 @@ func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
 	c.Cache.Add(key, data)
 }
 
-type repoLock struct {
-	sync.RWMutex
-	lastSynchronized time.Time
-}
-
 func runCommandLogged(cmd *exec.Cmd) error {
 	logger.Printf("[command %p] %q starting", cmd, cmd.Args)
 	defer logger.Printf("[command %p] %q finished", cmd, cmd.Args)
 
+	var wg sync.WaitGroup
+
+	errc := make(chan error, 2)
+
 	for _, s := range []struct {
-		writer *io.Writer
+		writer io.Writer
+		pipe   func() (io.ReadCloser, error)
 		name   string
 	}{
-		{&cmd.Stdout, "out"},
-		{&cmd.Stderr, "err"},
+		{cmd.Stdout, cmd.StdoutPipe, "out"},
+		{cmd.Stderr, cmd.StderrPipe, "err"},
 	} {
-		if *s.writer == nil {
-			*s.writer = &logwriter.LogWriter{
-				Logger:     logger,
-				Format:     "[command %p :: %s] %s",
-				FormatArgs: []interface{}{cmd, s.name},
-				Calldepth:  9,
+		if s.writer != nil {
+			continue
+		}
+
+		r, err := s.pipe()
+		if err != nil {
+			return err
+		}
+
+		wg.Add(1)
+		go func(r io.ReadCloser, name string) {
+			scanner := bufio.NewScanner(r)
+			for scanner.Scan() {
+				logger.Printf("[command %p :: %s] %s", cmd, name, scanner.Text())
+				break
 			}
+			errc <- scanner.Err()
+			wg.Done()
+		}(r, s.name)
+	}
+
+	err := cmd.Start()
+	if err != nil {
+		return err
+	}
+
+	wg.Wait()
+
+	close(errc)
+	for e := range errc {
+		if err == nil {
+			err = e
 		}
 	}
-	return cmd.Run()
+	if err != nil {
+		return err
+	}
+
+	return cmd.Wait()
 }
 
 func (s *server) synchronizeCache(repo *repository) error {
