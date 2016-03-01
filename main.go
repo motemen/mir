@@ -70,6 +70,13 @@ func (s *server) repository(repoPath string) *repository {
 	return repo
 }
 
+// packCache holds git-upload-pack response content for each pair of a
+// repository and a POST request body.
+// Since the response should not change over time for a given request, the
+// cache may last forever. Older pack data tend to be less used, so packCache
+// uses LRU caching.
+// The data are stored to local files as the size could become large.
+// TODO(motemen): use Writer/Reader interface, not to have the entire data in memory
 type packCache struct {
 	sync.Mutex
 	*lru.Cache
