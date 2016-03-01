@@ -1,6 +1,8 @@
 mir
 ===
 
+image::https://app.wercker.com/status/00178f4ed38e077b5332e5293e7b8688/s/master[Wercker status,link=https://app.wercker.com/project/bykey/00178f4ed38e077b5332e5293e7b8688]
+
 mir - A simple Git slave (smart) HTTP server.
 
 Usage
