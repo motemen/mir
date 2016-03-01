@@ -73,11 +73,31 @@ func (s *server) repository(repoPath string) *repository {
 type packCache struct {
 	sync.Mutex
 	*lru.Cache
+	basePath string
 }
 
-func (c *packCache) key(repo *repository, clientRequest []byte) string {
-	reqDigest := sha1.Sum(clientRequest)
-	return repo.path + "\000" + string(reqDigest[:])
+type packCacheKey struct {
+	repoPath  string
+	reqDigest [20]byte
+}
+
+func (c *packCache) init() {
+	c.Cache = lru.New(100) // TODO make configurable, say "--num-pack-cache="
+	c.Cache.OnEvicted = func(k lru.Key, v interface{}) {
+		os.Remove(v.(string))
+	}
+}
+
+func (c *packCache) cacheFile(k lru.Key) string {
+	key := k.(packCacheKey)
+	return filepath.Join(c.basePath, key.repoPath, fmt.Sprintf("%x", key.reqDigest))
+}
+
+func (c *packCache) key(repo *repository, clientRequest []byte) lru.Key {
+	return packCacheKey{
+		repoPath:  repo.path,
+		reqDigest: sha1.Sum(clientRequest),
+	}
 }
 
 func (c *packCache) Get(repo *repository, clientRequest []byte) []byte {
@@ -86,7 +106,8 @@ func (c *packCache) Get(repo *repository, clientRequest []byte) []byte {
 
 	key := c.key(repo, clientRequest)
 	if v, ok := c.Cache.Get(key); ok {
-		return v.([]byte)
+		b, _ := ioutil.ReadFile(v.(string))
+		return b
 	} else {
 		return nil
 	}
@@ -97,12 +118,19 @@ func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
 	defer c.Unlock()
 
 	key := c.key(repo, clientRequest)
-	c.Cache.Add(key, data)
-}
+	filename := c.cacheFile(key)
 
-type repoLock struct {
-	sync.RWMutex
-	lastSynchronized time.Time
+	if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
+		logger.Printf("[packcache %p] %s", c, err)
+		return
+	}
+
+	if err := ioutil.WriteFile(filename, data, 0777); err != nil {
+		logger.Printf("[packcache %p] Cache writing failed: %s, file=%q", c, err, filename)
+		return
+	}
+
+	c.Cache.Add(key, filename)
 }
 
 func runCommandLogged(cmd *exec.Cmd) error {
@@ -214,6 +242,8 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	w.Header().Set("Cache-Control", "no-cache")
 
 	if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
+		logger.Printf("[repo %q] Using cached pack", repo.path)
+
 		resp := make([]byte, len(packResponse))
 		copy(resp, packResponse)
 
@@ -287,6 +317,7 @@ func main() {
 	flag.StringVar(&s.upstream, "upstream", "", "upstream repositories' base `URL`")
 	flag.StringVar(&s.basePath, "base-path", "", "base `directory` for locally cloned repositories")
 	flag.StringVar(&listen, "listen", ":9280", "`address` to listen to")
+	flag.StringVar(&s.packCache.basePath, "packcache-path", "./cache/upload-pack", "root `directory` for packfile caches")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s -listen=<addr> -upstream=<url> -base-path=<path>\n", os.Args[0])
 		flag.PrintDefaults()
@@ -299,7 +330,7 @@ func main() {
 	}
 
 	s.refsFreshFor = 5 * time.Second // TODO make configurable, say "--refs-fresh-for="
-	s.packCache.Cache = lru.New(20)  // TODO make configurable, say "--num-pack-cache="
+	s.packCache.init()
 
 	logger.Printf("[server %p] mir starting at %s ...", &s, listen)
 
