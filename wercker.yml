@@ -7,12 +7,6 @@ build:
         name: go get
         code: |
           go get
-
-    - script:
-        name: go build
-        code: |
-          go build ./...
-
     - script:
         name: go test
         code: |
@@ -23,6 +17,10 @@ build:
         arch: amd64
         output: '{{.Dir}}_{{.OS}}_{{.Arch}}/{{.Dir}}'
         dest: $WERCKER_OUTPUT_DIR/pkg
+    - script:
+        name: build race version
+        code: |
+          go build -race -o $WERCKER_OUTPUT_DIR/pkg/mir_linux_amd64_race/mir
     - tcnksm/zip:
         input: $WERCKER_OUTPUT_DIR/pkg
         output: $WERCKER_OUTPUT_DIR/dist
