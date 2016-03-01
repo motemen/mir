@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"flag"
@@ -33,6 +32,16 @@ type repository struct {
 	upstreamURL      string
 	localDir         string
 	lastSynchronized time.Time
+}
+
+func (repo *repository) gitCommand(args ...string) repoCommand {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repo.localDir
+	return repoCommand{
+		repo:   repo,
+		cmd:    cmd,
+		logger: logger,
+	}
 }
 
 type server struct {
@@ -100,63 +109,6 @@ func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
 	c.Cache.Add(key, data)
 }
 
-func runCommandLogged(cmd *exec.Cmd) error {
-	logger.Printf("[command %p] %q starting", cmd, cmd.Args)
-	defer logger.Printf("[command %p] %q finished", cmd, cmd.Args)
-
-	var wg sync.WaitGroup
-
-	errc := make(chan error, 2)
-
-	for _, s := range []struct {
-		writer io.Writer
-		pipe   func() (io.ReadCloser, error)
-		name   string
-	}{
-		{cmd.Stdout, cmd.StdoutPipe, "out"},
-		{cmd.Stderr, cmd.StderrPipe, "err"},
-	} {
-		if s.writer != nil {
-			continue
-		}
-
-		r, err := s.pipe()
-		if err != nil {
-			return err
-		}
-
-		wg.Add(1)
-		go func(r io.ReadCloser, name string) {
-			scanner := bufio.NewScanner(r)
-			for scanner.Scan() {
-				logger.Printf("[command %p :: %s] %s", cmd, name, scanner.Text())
-				break
-			}
-			errc <- scanner.Err()
-			wg.Done()
-		}(r, s.name)
-	}
-
-	err := cmd.Start()
-	if err != nil {
-		return err
-	}
-
-	wg.Wait()
-
-	close(errc)
-	for e := range errc {
-		if err == nil {
-			err = e
-		}
-	}
-	if err != nil {
-		return err
-	}
-
-	return cmd.Wait()
-}
-
 func (s *server) synchronizeCache(repo *repository) error {
 	repo.Lock()
 	defer repo.Unlock()
@@ -174,9 +126,8 @@ func (s *server) synchronizeCache(repo *repository) error {
 				return err
 			}
 
-			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.upstreamURL, ".")
-			cmd.Dir = repo.localDir
-			err := runCommandLogged(cmd)
+			gitClone := repo.gitCommand("clone", "--verbose", "--mirror", repo.upstreamURL, ".")
+			err := gitClone.run()
 			if err == nil {
 				repo.lastSynchronized = time.Now()
 			}
@@ -187,9 +138,8 @@ func (s *server) synchronizeCache(repo *repository) error {
 	} else if fi != nil && fi.IsDir() {
 		// cache exists, update it
 		// TODO(motemen): check the directory is a valid git repository
-		cmd := exec.Command("git", "remote", "--verbose", "update")
-		cmd.Dir = repo.localDir
-		err := runCommandLogged(cmd)
+		gitRemoteUpdate := repo.gitCommand("remote", "--vebose", "update")
+		err := gitRemoteUpdate.run()
 		if err == nil {
 			repo.lastSynchronized = time.Now()
 		}
@@ -217,10 +167,9 @@ func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 	repo.RLock()
 	defer repo.RUnlock()
 
-	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
-	cmd.Stdout = w
-	cmd.Dir = repo.localDir
-	err := runCommandLogged(cmd)
+	gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", "--advertise-refs", ".")
+	gitUploadPack.cmd.Stdout = w
+	err := gitUploadPack.run()
 	if err != nil {
 		logger.Println(err)
 	}
@@ -264,11 +213,10 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 
 	var respBody bytes.Buffer
 
-	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
-	cmd.Stdout = &respBody
-	cmd.Stdin = bytes.NewBuffer(clientRequest)
-	cmd.Dir = repo.localDir
-	if err := runCommandLogged(cmd); err != nil {
+	gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", ".")
+	gitUploadPack.cmd.Stdout = &respBody
+	gitUploadPack.cmd.Stdin = bytes.NewBuffer(clientRequest)
+	if err := gitUploadPack.run(); err != nil {
 		logger.Println(err)
 		return
 	}
