@@ -56,6 +56,8 @@ func (s *server) repository(repoPath string) *repository {
 		s.repos.m = map[string]*repository{}
 	}
 
+	repoPath = strings.TrimSuffix(repoPath, ".git")
+
 	repo, ok := s.repos.m[repoPath]
 	if !ok {
 		repo = &repository{
@@ -150,6 +152,8 @@ func (s *server) synchronizeCache(repo *repository) error {
 			err := runCommandLogged(cmd)
 			if err == nil {
 				repo.lastSynchronized = time.Now()
+			} else {
+				os.Remove(repo.localDir)
 			}
 			return err
 		}
