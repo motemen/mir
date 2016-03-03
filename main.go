@@ -19,7 +19,6 @@ import (
 	"net/http"
 
 	"github.com/golang/groupcache/lru"
-	"github.com/motemen/go-nuts/logwriter"
 )
 
 var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
@@ -33,6 +32,16 @@ type repository struct {
 	upstreamURL      string
 	localDir         string
 	lastSynchronized time.Time
+}
+
+func (repo *repository) gitCommand(args ...string) repoCommand {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repo.localDir
+	return repoCommand{
+		repo:   repo,
+		cmd:    cmd,
+		logger: logger,
+	}
 }
 
 type server struct {
@@ -102,34 +111,6 @@ func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
 	c.Cache.Add(key, data)
 }
 
-type repoLock struct {
-	sync.RWMutex
-	lastSynchronized time.Time
-}
-
-func runCommandLogged(cmd *exec.Cmd) error {
-	logger.Printf("[command %p] %q starting", cmd, cmd.Args)
-	defer logger.Printf("[command %p] %q finished", cmd, cmd.Args)
-
-	for _, s := range []struct {
-		writer *io.Writer
-		name   string
-	}{
-		{&cmd.Stdout, "out"},
-		{&cmd.Stderr, "err"},
-	} {
-		if *s.writer == nil {
-			*s.writer = &logwriter.LogWriter{
-				Logger:     logger,
-				Format:     "[command %p :: %s] %s",
-				FormatArgs: []interface{}{cmd, s.name},
-				Calldepth:  9,
-			}
-		}
-	}
-	return cmd.Run()
-}
-
 func (s *server) synchronizeCache(repo *repository) error {
 	repo.Lock()
 	defer repo.Unlock()
@@ -147,9 +128,8 @@ func (s *server) synchronizeCache(repo *repository) error {
 				return err
 			}
 
-			cmd := exec.Command("git", "clone", "--verbose", "--mirror", repo.upstreamURL, ".")
-			cmd.Dir = repo.localDir
-			err := runCommandLogged(cmd)
+			gitClone := repo.gitCommand("clone", "--verbose", "--mirror", repo.upstreamURL, ".")
+			err := gitClone.run()
 			if err == nil {
 				repo.lastSynchronized = time.Now()
 			} else {
@@ -162,9 +142,8 @@ func (s *server) synchronizeCache(repo *repository) error {
 	} else if fi != nil && fi.IsDir() {
 		// cache exists, update it
 		// TODO(motemen): check the directory is a valid git repository
-		cmd := exec.Command("git", "remote", "--verbose", "update")
-		cmd.Dir = repo.localDir
-		err := runCommandLogged(cmd)
+		gitRemoteUpdate := repo.gitCommand("remote", "--vebose", "update")
+		err := gitRemoteUpdate.run()
 		if err == nil {
 			repo.lastSynchronized = time.Now()
 		}
@@ -192,10 +171,9 @@ func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 	repo.RLock()
 	defer repo.RUnlock()
 
-	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", "--advertise-refs", ".")
-	cmd.Stdout = w
-	cmd.Dir = repo.localDir
-	err := runCommandLogged(cmd)
+	gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", "--advertise-refs", ".")
+	gitUploadPack.cmd.Stdout = w
+	err := gitUploadPack.run()
 	if err != nil {
 		logger.Println(err)
 	}
@@ -239,11 +217,10 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 
 	var respBody bytes.Buffer
 
-	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
-	cmd.Stdout = &respBody
-	cmd.Stdin = bytes.NewBuffer(clientRequest)
-	cmd.Dir = repo.localDir
-	if err := runCommandLogged(cmd); err != nil {
+	gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", ".")
+	gitUploadPack.cmd.Stdout = &respBody
+	gitUploadPack.cmd.Stdin = bytes.NewBuffer(clientRequest)
+	if err := gitUploadPack.run(); err != nil {
 		logger.Println(err)
 		return
 	}
