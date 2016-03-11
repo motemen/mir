@@ -2,21 +2,20 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha1"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"compress/gzip"
-	"net/http"
 
 	"github.com/golang/groupcache/lru"
 	"github.com/motemen/go-nuts/logwriter"
@@ -113,11 +112,13 @@ func (c *packCache) Get(repo *repository, clientRequest []byte) []byte {
 
 	key := c.key(repo, clientRequest)
 	if v, ok := c.Cache.Get(key); ok {
-		b, _ := ioutil.ReadFile(v.(string))
-		return b
-	} else {
-		return nil
+		b, err := ioutil.ReadFile(v.(string))
+		if err == nil {
+			return b
+		}
 	}
+
+	return nil
 }
 
 func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
@@ -132,7 +133,7 @@ func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
 		return
 	}
 
-	if err := ioutil.WriteFile(filename, data, 0777); err != nil {
+	if err := ioutil.WriteFile(filename, data, 0666); err != nil {
 		logger.Printf("[packcache %p] Cache writing failed: %s, file=%q", c, err, filename)
 		return
 	}
