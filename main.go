@@ -78,8 +78,8 @@ func (s *server) repository(repoPath string) *repository {
 // TODO(motemen): use Writer/Reader interface, not to have the entire data in memory
 type packCache struct {
 	sync.Mutex
-	*lru.Cache
-	basePath string
+	*lru.Cache // packCacheKey to packCacheEntry
+	basePath   string
 }
 
 type packCacheKey struct {
@@ -87,58 +87,32 @@ type packCacheKey struct {
 	reqDigest [20]byte
 }
 
+type packCacheEntry struct {
+	filename string
+	done     chan struct{}
+}
+
 func (c *packCache) init() {
 	c.Cache = lru.New(100) // TODO make configurable, say "--num-pack-cache="
 	c.Cache.OnEvicted = func(k lru.Key, v interface{}) {
-		os.Remove(v.(string))
+		e := v.(*packCacheEntry)
+		go func() {
+			<-e.done
+			os.Remove(e.filename)
+		}()
 	}
 }
 
-func (c *packCache) cacheFile(k lru.Key) string {
-	key := k.(packCacheKey)
-	return filepath.Join(c.basePath, key.repoPath, fmt.Sprintf("%x", key.reqDigest))
-}
-
-func (c *packCache) key(repo *repository, clientRequest []byte) lru.Key {
-	return packCacheKey{
-		repoPath:  repo.path,
-		reqDigest: sha1.Sum(clientRequest),
-	}
-}
-
-func (c *packCache) Get(repo *repository, clientRequest []byte) []byte {
-	c.Lock()
-	defer c.Unlock()
-
-	key := c.key(repo, clientRequest)
+func (c *packCache) Get(key packCacheKey) (*packCacheEntry, bool) {
 	if v, ok := c.Cache.Get(key); ok {
-		b, err := ioutil.ReadFile(v.(string))
-		if err == nil {
-			return b
-		}
+		return v.(*packCacheEntry), true
+	} else {
+		return nil, false
 	}
-
-	return nil
 }
 
-func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
-	c.Lock()
-	defer c.Unlock()
-
-	key := c.key(repo, clientRequest)
-	filename := c.cacheFile(key)
-
-	if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
-		logger.Printf("[packcache %p] %s", c, err)
-		return
-	}
-
-	if err := ioutil.WriteFile(filename, data, 0666); err != nil {
-		logger.Printf("[packcache %p] Cache writing failed: %s, file=%q", c, err, filename)
-		return
-	}
-
-	c.Cache.Add(key, filename)
+func (c *packCache) Add(key packCacheKey, entry *packCacheEntry) {
+	c.Cache.Add(key, entry)
 }
 
 func runCommandLogged(cmd *exec.Cmd) error {
@@ -249,13 +223,24 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")
 
-	if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
+	key := packCacheKey{
+		repoPath:  repo.path,
+		reqDigest: sha1.Sum(clientRequest),
+	}
+
+	if entry, ok := s.packCache.Get(key); ok {
+		<-entry.done
+
+		logger.Printf("[cache %p] Found cache %s", s.packCache, entry.filename)
+		packResponse, _ := ioutil.ReadFile(entry.filename)
+
 		logger.Printf("[repo %q] Using cached pack", repo.path)
 
 		resp := make([]byte, len(packResponse))
 		copy(resp, packResponse)
 
 		message := "[mir] Using cached pack\n"
+		// TODO(motemen): Interleave message while streaming, not reading entire buffer
 		// 0x02 is the progress information band (see git/Documentation/technical/pack-protocol.txt)
 		progressLine := []byte(fmt.Sprintf("%04x\002%s", 4+1+len(message), message))
 
@@ -271,19 +256,34 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 		return
 	}
 
-	var respBody bytes.Buffer
+	entry := &packCacheEntry{
+		filename: filepath.Join("./cache", fmt.Sprint(time.Now().Nanosecond())),
+		done:     make(chan struct{}),
+	}
+
+	s.packCache.Lock()
+	s.packCache.Add(key, entry)
+	s.packCache.Unlock()
+
+	logger.Printf("[cache %p] Writing to %s", s.packCache, entry.filename)
+	cachew, _ := os.Create(entry.filename)
+	out := io.MultiWriter(w, cachew)
+
+	defer func() {
+		// TODO error handling
+		time.Sleep(time.Second * 30)
+		_ = cachew.Close()
+		close(entry.done)
+	}()
 
 	cmd := exec.Command("git", "upload-pack", "--stateless-rpc", ".")
-	cmd.Stdout = &respBody
+	cmd.Stdout = out
 	cmd.Stdin = bytes.NewBuffer(clientRequest)
 	cmd.Dir = repo.localDir
 	if err := runCommandLogged(cmd); err != nil {
 		logger.Println(err)
 		return
 	}
-
-	s.packCache.Add(repo, clientRequest, respBody.Bytes())
-	io.Copy(w, &respBody)
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
