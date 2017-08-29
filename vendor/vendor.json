@@ -1,0 +1,19 @@
+{
+	"comment": "",
+	"ignore": "test",
+	"package": [
+		{
+			"checksumSHA1": "nbCxiVT48CWEg6l8L4SEJ5VfN9c=",
+			"path": "github.com/golang/groupcache/lru",
+			"revision": "b710c8433bd175204919eb38776e944233235d03",
+			"revisionTime": "2017-04-21T00:56:42Z"
+		},
+		{
+			"checksumSHA1": "uWZVUtrTm5zYHEHujZKfcLX94yA=",
+			"path": "github.com/motemen/go-nuts/logwriter",
+			"revision": "49f2fd6dca147d5d713238550a422944d0581f69",
+			"revisionTime": "2017-08-29T00:26:34Z"
+		}
+	],
+	"rootPath": "github.com/motemen/mir"
+}
