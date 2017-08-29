@@ -142,7 +142,7 @@ func (s *server) synchronizeCache(repo *repository) error {
 	} else if fi != nil && fi.IsDir() {
 		// cache exists, update it
 		// TODO(motemen): check the directory is a valid git repository
-		gitRemoteUpdate := repo.gitCommand("remote", "--vebose", "update")
+		gitRemoteUpdate := repo.gitCommand("remote", "--verbose", "update")
 		err := gitRemoteUpdate.run()
 		if err == nil {
 			repo.lastSynchronized = time.Now()
