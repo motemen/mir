@@ -1,5 +1,11 @@
+ifeq ($(V),)
+    VERBOSE_FLAG=
+else
+    VERBOSE_FLAG=-v
+endif
+
 test:
-	go test ./...
+	go test $(VERBOSE_FLAG) ./...
 
 dist:
 	gox \

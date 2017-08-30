@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -184,12 +186,25 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	defer repo.RUnlock()
 
 	clientRequest, err := ioutil.ReadAll(r)
-	r.Close()
+	defer r.Close()
 
 	if err != nil {
 		logger.Println(err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	buf := bytes.NewBuffer(clientRequest)
+	if pkt := newPktLineScanner(buf); pkt.Scan() {
+		line := pkt.Text()
+		// should be 'first-want'
+		// https://github.com/git/git/blob/v2.7.1/Documentation/technical/pack-protocol.txt#L224
+		if strings.HasPrefix(line, "want ") && len(line) > len("want ")+40 && line[len("want ")+40] == ' ' {
+			capabilities := strings.Fields(line[len("want ")+40+1:])
+			logger.Printf("client capabilities: %v", capabilities)
+		} else {
+			logger.Printf("warning: not a first-want pkt-line: %q", line)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
@@ -288,4 +303,32 @@ func main() {
 	if err != nil {
 		logger.Println(err)
 	}
+}
+
+func newPktLineScanner(r io.Reader) *bufio.Scanner {
+	s := bufio.NewScanner(r)
+	s.Split(splitPktLine)
+	return s
+}
+
+func splitPktLine(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && data == nil {
+		return
+	}
+
+	var n int64
+	n, err = strconv.ParseInt(string(data[0:4]), 16, 32)
+	if err != nil {
+		return
+	}
+
+	if n == 0 {
+		advance = 4
+		token = []byte{}
+		return
+	}
+
+	advance = int(n)
+	token = data[4:n]
+	return
 }
