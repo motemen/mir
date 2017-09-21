@@ -113,6 +113,8 @@ func (c *packCache) Add(repo *repository, clientRequest []byte, data []byte) {
 	c.Cache.Add(key, data)
 }
 
+// synchronizeCache fetches Git content from upstream to synchronize local copy of repo.
+// It does not synchronize if last synchronized time is within s.refsFreshFor from now.
 func (s *server) synchronizeCache(repo *repository) error {
 	repo.Lock()
 	defer repo.Unlock()
@@ -145,16 +147,18 @@ func (s *server) synchronizeCache(repo *repository) error {
 		// cache exists, update it
 		// TODO(motemen): check the directory is a valid git repository
 		gitRemoteUpdate := repo.gitCommand("remote", "--verbose", "update")
-		err := gitRemoteUpdate.run()
-		if err == nil {
-			repo.lastSynchronized = time.Now()
+		if err := gitRemoteUpdate.run(); err != nil {
+			return err
 		}
-		return err
+		repo.lastSynchronized = time.Now()
+		return nil
 	}
 
 	return fmt.Errorf("could not synchronize cache: %v", repo)
 }
 
+// advertiseRefs sends the refs list to client.
+// It roughly corresponds to "git ls-remote."
 func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 	// TODO(motemen): Consider serving remote response and move
 	// synchronizeCache to another goroutine. Note we have to implement each
@@ -170,6 +174,7 @@ func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 	fmt.Fprint(w, "001e# service=git-upload-pack\n")
 	fmt.Fprint(w, "0000")
 
+	// do not want to list refs while mirroring, so RLock
 	repo.RLock()
 	defer repo.RUnlock()
 
@@ -179,8 +184,15 @@ func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 	if err != nil {
 		logger.Println(err)
 	}
+
+	// no need to return err, as the client knows if something goes wrong
 }
 
+// uploadPack sends the Git objects to client.
+// Canonical Git implimentation does interactive negotiation,
+// but for caching purpose this reads all the client's request body
+// and then responds to it.
+// TODO(motemen): check if caching really works
 func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCloser) {
 	repo.RLock()
 	defer repo.RUnlock()
@@ -195,9 +207,10 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	}
 
 	buf := bytes.NewBuffer(clientRequest)
+	// log client capabilities
 	if pkt := newPktLineScanner(buf); pkt.Scan() {
 		line := pkt.Text()
-		// should be 'first-want'
+		// must be 'first-want'
 		// https://github.com/git/git/blob/v2.7.1/Documentation/technical/pack-protocol.txt#L224
 		if strings.HasPrefix(line, "want ") && len(line) > len("want ")+40 && line[len("want ")+40] == ' ' {
 			capabilities := strings.Fields(line[len("want ")+40+1:])
@@ -211,22 +224,7 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	w.Header().Set("Cache-Control", "no-cache")
 
 	if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
-		resp := make([]byte, len(packResponse))
-		copy(resp, packResponse)
-
-		message := "[mir] Using cached pack\n"
-		// 0x02 is the progress information band (see git/Documentation/technical/pack-protocol.txt)
-		progressLine := []byte(fmt.Sprintf("%04x\002%s", 4+1+len(message), message))
-
-		if p := bytes.Index(packResponse, []byte("0008NAK\n")); p != -1 {
-			resp = append(resp[0:p+0x0008], progressLine...)
-			resp = append(resp, packResponse[p+0x0008:]...)
-		} else if p := bytes.Index(packResponse, []byte("0031ACK ")); p != -1 {
-			resp = append(resp[0:p+0x0031], progressLine...)
-			resp = append(resp, packResponse[p+0x0031:]...)
-		}
-
-		w.Write(resp)
+		w.Write(packResponse)
 		return
 	}
 
@@ -248,7 +246,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	logger.Printf("[request %p] %s %s %v", req, req.Method, req.URL, req.Header)
 
 	if strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
-		// mode: ref delivery
+		// mode: ref discovery
 		repoPath := strings.TrimSuffix(req.URL.Path[1:], "/info/refs")
 		repo := s.repository(repoPath)
 

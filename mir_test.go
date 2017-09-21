@@ -4,6 +4,8 @@ import "testing"
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -13,9 +15,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/groupcache/lru"
+	"github.com/pkg/errors"
 )
 
 var gitDaemon *gitDaemonSpec
@@ -45,16 +50,27 @@ func (d gitDaemonSpec) addRepo(path string) (repo upstreamRepo, err error) {
 type upstreamRepo string
 
 func (r upstreamRepo) addNewCommit() error {
-	cmd := exec.Command("git", "--work-tree", ".", "--git-dir", string(r), "commit", "--allow-empty", "-m", "msg")
-	cmd.Stderr = os.Stderr
-	cmd.Env = []string{
-		"GIT_AUTHOR_NAME=test",
-		"GIT_AUTHOR_EMAIL=test@example.com",
-		"GIT_COMMITTER_NAME=test",
-		"GIT_COMMITTER_EMAIL=test@example.com",
+	tempdir, err := ioutil.TempDir("", "")
+	if err != nil {
+		return err
 	}
 
-	return cmd.Run()
+	filename := filepath.Join(tempdir, fmt.Sprint(time.Now().UnixNano()))
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < 100; i++ {
+		fmt.Fprint(f, time.Now().UnixNano())
+	}
+	f.Close()
+
+	if err := runCommand("git", "--work-tree", tempdir, "--git-dir", string(r), "add", filename); err != nil {
+		return err
+	}
+
+	return runCommand("git", "--work-tree", tempdir, "--git-dir", string(r), "commit", "-m", "msg")
 }
 
 func startGitDaemon() (daemon *gitDaemonSpec, err error) {
@@ -109,6 +125,13 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func runCommand(command string, args ...string) error {
+	var buf bytes.Buffer
+	cmd := exec.Command(command, args...)
+	cmd.Stderr = &buf
+	return errors.Wrapf(cmd.Run(), "%s %v: %s", command, args, buf.String())
+}
+
 func TestMir_Smoke(t *testing.T) {
 	workTreeBase, err := ioutil.TempDir("", "mir-test-worktree")
 	if err != nil {
@@ -122,7 +145,7 @@ func TestMir_Smoke(t *testing.T) {
 	}
 	defer os.RemoveAll(mirBase)
 
-	_, err = gitDaemon.addRepo("foo/bar")
+	repo, err := gitDaemon.addRepo("foo/bar")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,13 +160,55 @@ func TestMir_Smoke(t *testing.T) {
 	s := httptest.NewServer(&mir)
 	defer s.Close()
 
-	cmd := exec.Command("git", "clone", s.URL+"/foo/bar.git")
-	cmd.Dir = workTreeBase
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		t.Fatal(err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	go func() {
+		for i := 1; ; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			time.Sleep(time.Millisecond * 500)
+			err := repo.addNewCommit()
+			if err != nil {
+				t.Fatalf("addNewCommit(%d): %s", i, err)
+			}
+		}
+	}()
+
+	sem := make(chan struct{}, 100)
+	var i int32
+	var wg sync.WaitGroup
+FOR:
+	for {
+		select {
+		case <-ctx.Done():
+			break FOR
+		case sem <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func() {
+			defer func() { _ = <-sem }()
+			defer wg.Done()
+
+			i := atomic.AddInt32(&i, 1)
+
+			wd := filepath.Join(workTreeBase, fmt.Sprint(i))
+			if err := os.Mkdir(wd, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := runCommand("git", "clone", "--quiet", s.URL+"/foo/bar.git", wd); err != nil {
+				t.Fatal(err)
+			}
+		}()
 	}
+
+	wg.Wait()
 }
 
 func emptyPort() (int, error) {
