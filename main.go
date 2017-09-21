@@ -3,12 +3,15 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha1"
+	"expvar"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,13 +20,15 @@ import (
 	"sync"
 	"time"
 
-	"compress/gzip"
-	"net/http"
-
 	"github.com/golang/groupcache/lru"
 )
 
 var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
+
+var (
+	packCacheHit = expvar.NewInt("packCacheHit")
+	syncSkipped  = expvar.NewInt("syncSkipped")
+)
 
 // repository represents a repository that mir synchronizes.
 // A *repository instance is unique by its path (under a *server),
@@ -57,6 +62,7 @@ type server struct {
 
 	packCache    packCache
 	refsFreshFor time.Duration
+	noCachePack  bool
 }
 
 func (s *server) repository(repoPath string) *repository {
@@ -120,6 +126,7 @@ func (s *server) synchronizeCache(repo *repository) error {
 	defer repo.Unlock()
 
 	if time.Now().Before(repo.lastSynchronized.Add(s.refsFreshFor)) {
+		syncSkipped.Add(1)
 		logger.Printf("[repo %s] Refs last synchronized at %s, not synchronizing repo", repo.path, repo.lastSynchronized)
 		return nil
 	}
@@ -192,54 +199,67 @@ func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 // Canonical Git implimentation does interactive negotiation,
 // but for caching purpose this reads all the client's request body
 // and then responds to it.
-// TODO(motemen): check if caching really works
 func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCloser) {
 	repo.RLock()
 	defer repo.RUnlock()
 
-	clientRequest, err := ioutil.ReadAll(r)
-	defer r.Close()
+	if s.noCachePack {
+		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+		w.Header().Set("Cache-Control", "no-cache")
 
-	if err != nil {
-		logger.Println(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	buf := bytes.NewBuffer(clientRequest)
-	// log client capabilities
-	if pkt := newPktLineScanner(buf); pkt.Scan() {
-		line := pkt.Text()
-		// must be 'first-want'
-		// https://github.com/git/git/blob/v2.7.1/Documentation/technical/pack-protocol.txt#L224
-		if strings.HasPrefix(line, "want ") && len(line) > len("want ")+40 && line[len("want ")+40] == ' ' {
-			capabilities := strings.Fields(line[len("want ")+40+1:])
-			logger.Printf("client capabilities: %v", capabilities)
-		} else {
-			logger.Printf("warning: not a first-want pkt-line: %q", line)
+		gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", ".")
+		gitUploadPack.cmd.Stdout = w
+		gitUploadPack.cmd.Stdin = r
+		if err := gitUploadPack.run(); err != nil {
+			logger.Println(err)
+			return
 		}
+	} else {
+		clientRequest, err := ioutil.ReadAll(r)
+		defer r.Close()
+
+		if err != nil {
+			logger.Println(err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		buf := bytes.NewBuffer(clientRequest)
+		// log client capabilities
+		if pkt := newPktLineScanner(buf); pkt.Scan() {
+			line := pkt.Text()
+			// must be 'first-want'
+			// https://github.com/git/git/blob/v2.7.1/Documentation/technical/pack-protocol.txt#L224
+			if strings.HasPrefix(line, "want ") && len(line) > len("want ")+40 && line[len("want ")+40] == ' ' {
+				capabilities := strings.Fields(line[len("want ")+40+1:])
+				logger.Printf("client capabilities: %v", capabilities)
+			} else {
+				logger.Printf("warning: not a first-want pkt-line: %q", line)
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+		w.Header().Set("Cache-Control", "no-cache")
+
+		if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
+			packCacheHit.Add(1)
+			w.Write(packResponse)
+			return
+		}
+
+		var respBody bytes.Buffer
+
+		gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", ".")
+		gitUploadPack.cmd.Stdout = &respBody
+		gitUploadPack.cmd.Stdin = bytes.NewBuffer(clientRequest)
+		if err := gitUploadPack.run(); err != nil {
+			logger.Println(err)
+			return
+		}
+
+		s.packCache.Add(repo, clientRequest, respBody.Bytes())
+		io.Copy(w, &respBody)
 	}
-
-	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-	w.Header().Set("Cache-Control", "no-cache")
-
-	if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
-		w.Write(packResponse)
-		return
-	}
-
-	var respBody bytes.Buffer
-
-	gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", ".")
-	gitUploadPack.cmd.Stdout = &respBody
-	gitUploadPack.cmd.Stdin = bytes.NewBuffer(clientRequest)
-	if err := gitUploadPack.run(); err != nil {
-		logger.Println(err)
-		return
-	}
-
-	s.packCache.Add(repo, clientRequest, respBody.Bytes())
-	io.Copy(w, &respBody)
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {

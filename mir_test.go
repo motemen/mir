@@ -133,17 +133,25 @@ func runCommand(command string, args ...string) error {
 }
 
 func TestMir_Smoke(t *testing.T) {
+	logger.SetOutput(ioutil.Discard)
+
 	workTreeBase, err := ioutil.TempDir("", "mir-test-worktree")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(workTreeBase)
+	defer func() {
+		t.Log("removing worktree")
+		os.RemoveAll(workTreeBase)
+	}()
 
 	mirBase, err := ioutil.TempDir("", "mir-test-base")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(mirBase)
+	defer func() {
+		t.Log("removing mir base")
+		os.RemoveAll(mirBase)
+	}()
 
 	repo, err := gitDaemon.addRepo("foo/bar")
 	if err != nil {
@@ -153,14 +161,15 @@ func TestMir_Smoke(t *testing.T) {
 	mir := server{
 		basePath:     mirBase,
 		upstream:     fmt.Sprintf("git://localhost:%d/", gitDaemon.port),
-		refsFreshFor: 5 * time.Second,
+		refsFreshFor: 50 * time.Millisecond,
 	}
 	mir.packCache.Cache = lru.New(20)
 
 	s := httptest.NewServer(&mir)
 	defer s.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	duration := 60 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
 	go func() {
@@ -180,7 +189,7 @@ func TestMir_Smoke(t *testing.T) {
 	}()
 
 	sem := make(chan struct{}, 100)
-	var i int32
+	var count int32
 	var wg sync.WaitGroup
 FOR:
 	for {
@@ -195,9 +204,9 @@ FOR:
 			defer func() { _ = <-sem }()
 			defer wg.Done()
 
-			i := atomic.AddInt32(&i, 1)
+			count := atomic.AddInt32(&count, 1)
 
-			wd := filepath.Join(workTreeBase, fmt.Sprint(i))
+			wd := filepath.Join(workTreeBase, fmt.Sprint(count))
 			if err := os.Mkdir(wd, 0755); err != nil {
 				t.Fatal(err)
 			}
@@ -209,6 +218,10 @@ FOR:
 	}
 
 	wg.Wait()
+
+	fmt.Printf("Processed %d clones in %s\n", count, duration)
+	fmt.Printf("syncSkipped: %d\n", syncSkipped.Value())
+	fmt.Printf("packCacheHit: %d\n", packCacheHit.Value())
 }
 
 func emptyPort() (int, error) {
