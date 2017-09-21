@@ -295,12 +295,15 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 func main() {
 	var (
-		s      server
-		listen string
+		s            server
+		listen       string
+		numPackCache int
 	)
 	flag.StringVar(&s.upstream, "upstream", "", "upstream repositories' base `URL`")
 	flag.StringVar(&s.basePath, "base-path", "", "base `directory` for locally cloned repositories")
 	flag.StringVar(&listen, "listen", ":9280", "`address` to listen to")
+	flag.DurationVar(&s.refsFreshFor, "refs-fresh-for", 5*time.Second, "`duration` to consider synchronized refs (keep this very short)")
+	flag.IntVar(&numPackCache, "num-pack-cache", 20, "`number` of pack caches to keep in memory")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s -listen=<addr> -upstream=<url> -base-path=<path>\n", os.Args[0])
 		flag.PrintDefaults()
@@ -312,8 +315,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	s.refsFreshFor = 5 * time.Second // TODO make configurable, say "--refs-fresh-for="
-	s.packCache.Cache = lru.New(20)  // TODO make configurable, say "--num-pack-cache="
+	s.packCache.Cache = lru.New(numPackCache)
 
 	logger.Printf("[server %p] mir starting at %s ...", &s, listen)
 
