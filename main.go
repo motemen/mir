@@ -30,7 +30,7 @@ var (
 	syncSkipped  = expvar.NewInt("syncSkipped")
 )
 
-var version = "v0.2.0"
+var version = "0.3.0"
 
 // repository represents a repository that mir synchronizes.
 // A *repository instance is unique by its path (under a *server),
