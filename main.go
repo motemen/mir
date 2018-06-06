@@ -30,6 +30,8 @@ var (
 	syncSkipped  = expvar.NewInt("syncSkipped")
 )
 
+var version = "v0.2.0"
+
 // repository represents a repository that mir synchronizes.
 // A *repository instance is unique by its path (under a *server),
 // so calling its Lock() makes sense.
@@ -299,17 +301,24 @@ func main() {
 		s            server
 		listen       string
 		numPackCache int
+		printVersion bool
 	)
 	flag.StringVar(&s.upstream, "upstream", "", "upstream repositories' base `URL`")
 	flag.StringVar(&s.basePath, "base-path", "", "base `directory` for locally cloned repositories")
 	flag.StringVar(&listen, "listen", ":9280", "`address` to listen to")
 	flag.DurationVar(&s.refsFreshFor, "refs-fresh-for", 5*time.Second, "`duration` to consider synchronized refs (keep this very short)")
 	flag.IntVar(&numPackCache, "num-pack-cache", 20, "`number` of pack caches to keep in memory")
+	flag.BoolVar(&printVersion, "version", false, "print version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s -listen=<addr> -upstream=<url> -base-path=<path>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if printVersion {
+		fmt.Printf("mir %s\n", version)
+		os.Exit(0)
+	}
 
 	if s.upstream == "" || s.basePath == "" {
 		flag.Usage()
@@ -318,7 +327,7 @@ func main() {
 
 	s.packCache.Cache = lru.New(numPackCache)
 
-	logger.Printf("[server %p] mir starting at %s ...", &s, listen)
+	logger.Printf("[server %p] mir %s starting at %s ...", &s, version, listen)
 
 	err := http.ListenAndServe(listen, &s)
 	if err != nil {
