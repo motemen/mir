@@ -31,6 +31,6 @@ func TestPktLineScanner(t *testing.T) {
 	nextScan(t, s, "have 136802d3c5782043066e192863c45c421b88f0a8\n")
 	nextScan(t, s, "done\n")
 	if s.Scan() == true {
-		t.Fatal("got Scan() == true, Text() = %q", s.Text())
+		t.Fatalf("got Scan() == true, Text() = %q", s.Text())
 	}
 }

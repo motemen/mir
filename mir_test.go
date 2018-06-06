@@ -168,7 +168,7 @@ func TestMir_Smoke(t *testing.T) {
 	s := httptest.NewServer(&mir)
 	defer s.Close()
 
-	duration := 60 * time.Second
+	duration := 10 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 

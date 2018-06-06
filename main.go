@@ -62,7 +62,8 @@ type server struct {
 
 	packCache    packCache
 	refsFreshFor time.Duration
-	noCachePack  bool
+	// experimental
+	useCachePack bool
 }
 
 func (s *server) repository(repoPath string) *repository {
@@ -203,7 +204,7 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	repo.RLock()
 	defer repo.RUnlock()
 
-	if s.noCachePack {
+	if s.useCachePack == false {
 		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 		w.Header().Set("Cache-Control", "no-cache")
 
@@ -212,54 +213,54 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 		gitUploadPack.cmd.Stdin = r
 		if err := gitUploadPack.run(); err != nil {
 			logger.Println(err)
-			return
 		}
-	} else {
-		clientRequest, err := ioutil.ReadAll(r)
-		defer r.Close()
-
-		if err != nil {
-			logger.Println(err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		buf := bytes.NewBuffer(clientRequest)
-		// log client capabilities
-		if pkt := newPktLineScanner(buf); pkt.Scan() {
-			line := pkt.Text()
-			// must be 'first-want'
-			// https://github.com/git/git/blob/v2.7.1/Documentation/technical/pack-protocol.txt#L224
-			if strings.HasPrefix(line, "want ") && len(line) > len("want ")+40 && line[len("want ")+40] == ' ' {
-				capabilities := strings.Fields(line[len("want ")+40+1:])
-				logger.Printf("client capabilities: %v", capabilities)
-			} else {
-				logger.Printf("warning: not a first-want pkt-line: %q", line)
-			}
-		}
-
-		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-		w.Header().Set("Cache-Control", "no-cache")
-
-		if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
-			packCacheHit.Add(1)
-			w.Write(packResponse)
-			return
-		}
-
-		var respBody bytes.Buffer
-
-		gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", ".")
-		gitUploadPack.cmd.Stdout = &respBody
-		gitUploadPack.cmd.Stdin = bytes.NewBuffer(clientRequest)
-		if err := gitUploadPack.run(); err != nil {
-			logger.Println(err)
-			return
-		}
-
-		s.packCache.Add(repo, clientRequest, respBody.Bytes())
-		io.Copy(w, &respBody)
+		return
 	}
+
+	clientRequest, err := ioutil.ReadAll(r)
+	defer r.Close()
+
+	if err != nil {
+		logger.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	buf := bytes.NewBuffer(clientRequest)
+	// log client capabilities
+	if pkt := newPktLineScanner(buf); pkt.Scan() {
+		line := pkt.Text()
+		// must be 'first-want'
+		// https://github.com/git/git/blob/v2.7.1/Documentation/technical/pack-protocol.txt#L224
+		if strings.HasPrefix(line, "want ") && len(line) > len("want ")+40 && line[len("want ")+40] == ' ' {
+			capabilities := strings.Fields(line[len("want ")+40+1:])
+			logger.Printf("client capabilities: %v", capabilities)
+		} else {
+			logger.Printf("warning: not a first-want pkt-line: %q", line)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	if packResponse := s.packCache.Get(repo, clientRequest); packResponse != nil {
+		packCacheHit.Add(1)
+		w.Write(packResponse)
+		return
+	}
+
+	var respBody bytes.Buffer
+
+	gitUploadPack := repo.gitCommand("upload-pack", "--stateless-rpc", ".")
+	gitUploadPack.cmd.Stdout = &respBody
+	gitUploadPack.cmd.Stdin = bytes.NewBuffer(clientRequest)
+	if err := gitUploadPack.run(); err != nil {
+		logger.Println(err)
+		return
+	}
+
+	s.packCache.Add(repo, clientRequest, respBody.Bytes())
+	io.Copy(w, &respBody)
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
