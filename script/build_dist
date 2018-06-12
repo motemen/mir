@@ -1,0 +1,28 @@
+#!/bin/bash
+
+set -e
+
+root="$(git rev-parse --show-toplevel)"
+
+version=$(git describe --tags --exact-match) || exit 1
+
+distdir="$root/dist/$version"
+builddir="$distdir/build"
+
+cd "$root"
+
+if ! [ -d "$distdir" ]; then
+    mkdir -p "$builddir" "$distdir"
+
+    gox -output "$builddir/{{.Dir}}_{{.OS}}_{{.Arch}}/{{.Dir}}" -os 'linux' -arch '386 amd64'
+
+    for dir in "$builddir"/*; do
+        echo "$dir"
+        if [ -d "$dir" ]; then
+            cp README.adoc "$dir/README.adoc"
+            ( cd "$dir" && tar cfz "$distdir/$(basename "$dir")".tar.gz ./* )
+        fi
+    done
+
+    ( cd "$distdir" && shasum $(find * -type f -maxdepth 0) > SHASUMS )
+fi

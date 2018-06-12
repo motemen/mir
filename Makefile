@@ -4,20 +4,20 @@ else
     VERBOSE_FLAG=-v
 endif
 
+VERSION=$$(git describe --tags --exact-match)
+
 test:
 	go test $(VERBOSE_FLAG) ./...
 
 dist:
-	gox \
-	    -os='linux' \
-	    -arch='386 amd64' \
-	    -output='build/{{.Dir}}_{{.OS}}_{{.Arch}}'
+	rm -fr dist/
+	script/build_dist
 
 release: dist
 	git describe --tags --exact-match
-	ghr -draft $$(git describe --tags --exact-match) build/
+	ghr -username motemen -draft $(VERSION) dist/$(VERSION)
 
 release-pre: dist
-	ghr -draft -prerelease pre build/
+	ghr -usename motemen -draft -prerelease pre dist/
 
 .PHONY: dist release release-pre
