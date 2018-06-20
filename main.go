@@ -203,6 +203,12 @@ func (s *server) advertiseRefs(repo *repository, w http.ResponseWriter) {
 // but for caching purpose this reads all the client's request body
 // and then responds to it.
 func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCloser) {
+	if err := s.synchronizeCache(repo); err != nil {
+		logger.Println(err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	repo.RLock()
 	defer repo.RUnlock()
 
