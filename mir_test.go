@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -115,6 +116,8 @@ func startGitDaemon() (daemon *gitDaemonSpec, err error) {
 }
 
 func TestMain(m *testing.M) {
+	logger.SetOutput(ioutil.Discard)
+
 	var err error
 	gitDaemon, err = startGitDaemon()
 	if err != nil {
@@ -132,9 +135,16 @@ func runCommand(command string, args ...string) error {
 	return errors.Wrapf(cmd.Run(), "%s %v: %s", command, args, buf.String())
 }
 
-func TestMir_Smoke(t *testing.T) {
-	logger.SetOutput(ioutil.Discard)
+func runCommandOutput(command string, args ...string) (*bytes.Buffer, error) {
+	var outBuf bytes.Buffer
+	var errBuf bytes.Buffer
+	cmd := exec.Command(command, args...)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	return &outBuf, errors.Wrapf(cmd.Run(), "%s %v: %s", command, args, errBuf.String())
+}
 
+func TestMir_Smoke(t *testing.T) {
 	workTreeBase, err := ioutil.TempDir("", "mir-test-worktree")
 	if err != nil {
 		t.Fatal(err)
@@ -222,6 +232,129 @@ FOR:
 	fmt.Printf("Processed %d clones in %s\n", count, duration)
 	fmt.Printf("syncSkipped: %d\n", syncSkipped.Value())
 	fmt.Printf("packCacheHit: %d\n", packCacheHit.Value())
+}
+
+func TestMir_Scaled(t *testing.T) {
+	// When multiple mir's are forming a Git-proxy cluster,
+	// there are chances that one server is receiving an upload-pack request
+	// based on ref advertising sent from another server.
+	// This test emulates that situation.
+
+	wd, err := ioutil.TempDir("", "mir-test-worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		t.Log("removing worktree")
+		os.RemoveAll(wd)
+	}()
+
+	mirBase1, err := ioutil.TempDir("", "mir-test-base1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		t.Log("removing mir base (1)")
+		os.RemoveAll(mirBase1)
+	}()
+
+	mirBase2, err := ioutil.TempDir("", "mir-test-base2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		t.Log("removing mir base (2)")
+		os.RemoveAll(mirBase2)
+	}()
+
+	repo, err := gitDaemon.addRepo("foo/bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mir1 := server{
+		basePath:     mirBase1,
+		upstream:     fmt.Sprintf("git://localhost:%d/", gitDaemon.port),
+		refsFreshFor: 50 * time.Millisecond,
+	}
+
+	mir2 := server{
+		basePath:     mirBase2,
+		upstream:     fmt.Sprintf("git://localhost:%d/", gitDaemon.port),
+		refsFreshFor: 50 * time.Millisecond,
+	}
+
+	s1 := httptest.NewServer(&mir1)
+	defer s1.Close()
+
+	s2 := httptest.NewServer(&mir2)
+	defer s2.Close()
+
+	err = repo.addNewCommit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runCommand("git", "init", wd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// sync both server
+	err = runCommand("git", "ls-remote", s1.URL+"/foo/bar.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runCommand("git", "ls-remote", s2.URL+"/foo/bar.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(mir1.refsFreshFor * 2)
+
+	// advance source repository
+	err = repo.addNewCommit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// then sync 1 only
+	err = runCommand("git", "fetch", s1.URL+"/foo/bar.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runCommandOutput("git", "rev-parse", "FETCH_HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	headRev := strings.TrimSpace(out.String())
+
+	// request upload-pack without the step of ref advertising
+	for i, s := range []*httptest.Server{s1, s2} {
+		resp, err := http.Post(
+			s.URL+"/foo/bar.git/git-upload-pack",
+			"",
+			bytes.NewBufferString(
+				"003ewant "+headRev+" no-progress\n"+
+					"+0000"+
+					"0009done\n",
+			),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		s := newPktLineScanner(resp.Body)
+		for s.Scan() {
+			line := s.Text()
+			if strings.HasPrefix(line, "ERR ") {
+				t.Fatalf("got error from server %d: %q", i+1, line)
+			}
+		}
+	}
 }
 
 func emptyPort() (int, error) {
