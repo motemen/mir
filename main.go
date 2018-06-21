@@ -271,6 +271,8 @@ func (s *server) uploadPack(repo *repository, w http.ResponseWriter, r io.ReadCl
 	io.Copy(w, &respBody)
 }
 
+var expvarHandler = expvar.Handler()
+
 func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	logger.Printf("[request %p] %s %s %v", req, req.Method, req.URL, req.Header)
 
@@ -297,6 +299,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 
 		s.uploadPack(repo, w, r)
+	} else if req.Method == "GET" && req.URL.Path == "/debug/vars" {
+		expvarHandler.ServeHTTP(w, req)
 	} else {
 		http.Error(w, "Not Implemented", http.StatusNotImplemented)
 	}
