@@ -23,7 +23,7 @@ import (
 	"github.com/golang/groupcache/lru"
 )
 
-var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile|log.Lmicroseconds)
+var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 
 var (
 	packCacheHit = expvar.NewInt("packCacheHit")
